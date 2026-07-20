@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nifty-bot
+    restart: unless-stopped
+    
+    environment:
+      # Fyers credentials from .env file
+      - FYERS_APP_ID=${FYERS_APP_ID}
+      - FYERS_SECRET=${FYERS_SECRET}
+      - FYERS_ACCESS_TOKEN=${FYERS_ACCESS_TOKEN}
+      - FYERS_REDIRECT_URI=${FYERS_REDIRECT_URI:-http://127.0.0.1:8000/api/auth/callback}
+      
+      # Trading config
+      - PAPER_TRADING=${PAPER_TRADING:-true}
+      - CAPITAL=${CAPITAL:-100000}
+      - RISK_PER_TRADE=${RISK_PER_TRADE:-0.01}
+      - MAX_DAILY_LOSS=${MAX_DAILY_LOSS:-0.025}
+      - MAX_WEEKLY_LOSS=${MAX_WEEKLY_LOSS:-0.05}
+      - MAX_TRADES_PER_DAY=${MAX_TRADES_PER_DAY:-5}
+      - COOLDOWN_MINUTES=${COOLDOWN_MINUTES:-30}
+      - NEWS_BLACKOUT_MINUTES=${NEWS_BLACKOUT_MINUTES:-15}
+      
+      # Thresholds
+      - MIN_SCORE_THRESHOLD=${MIN_SCORE_THRESHOLD:-55}
+      - MIN_RISK_REWARD=${MIN_RISK_REWARD:-1.5}
+      
+      # Session
+      - TRADING_START_TIME=${TRADING_START_TIME:-09:15}
+      - TRADING_END_TIME=${TRADING_END_TIME:-15:30}
+      
+      # Database
+      - DB_PATH=/app/data/trades.db
+      
+      # Admin
+      - ADMIN_SECRET_KEY=${ADMIN_SECRET_KEY:-change-me-in-production}
+      
+      # Logging
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    
+    ports:
+      - "8000:8000"
+    
+    volumes:
+      # Persist database and tokens across restarts
+      - bot_data:/app/data
+      - ./logs:/app/logs
+    
+    networks:
+      - bot_network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # Optional: Redis for caching/sessions
+  redis:
+    image: redis:7-alpine
+    container_name: nifty-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - bot_network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # Optional: Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: nifty-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - bot
+    networks:
+      - bot_network
+
+volumes:
+  bot_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  bot_network:
+    driver: bridge

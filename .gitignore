@@ -1,0 +1,62 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Type checking / linting
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Alembic (if using migrations, keep versions but ignore local overrides)
+# alembic/versions/*.pyc
+
+# FastAPI / uvicorn
+*.pid
+
+# Docker (uncomment if you don't want to track these)
+# docker-compose.override.yml
