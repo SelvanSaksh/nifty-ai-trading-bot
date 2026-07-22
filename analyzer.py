@@ -13,41 +13,59 @@ class Analyzer:
     """Computes the full analytical picture for each closed candle."""
     
     def __init__(self):
+        self.candles_5m: List[Candle] = []
         self.candles_15m: List[Candle] = []
         self.candles_1h: List[Candle] = []
     
     def add_tick(self, price: float, volume: int, timestamp: datetime) -> Optional[Candle]:
-        """Process incoming tick, build candle, return if candle closed."""
-        # Simplified: in production, manage candle building with proper time alignment
-        current_candle = self._get_or_create_candle(timestamp, price, volume)
-        current_candle.high = max(current_candle.high, price)
-        current_candle.low = min(current_candle.low, price)
-        current_candle.close = price
-        current_candle.volume += volume
-        
-        # Check if candle closed (every 15 min)
-        if self._is_candle_closed(current_candle, timestamp):
-            self._finalize_candle(current_candle)
-            return current_candle
-        return None
-    
-    def _get_or_create_candle(self, ts: datetime, price: float, volume: int) -> Candle:
-        # Simplified implementation
-        if not self.candles_15m or self._is_new_candle_needed(ts, self.candles_15m[-1]):
+        """Process incoming tick, build candles for all timeframes."""
+        closed_candle = None
+
+        # Build 5m candle
+        candle_5m = self._get_or_create_candle_for_tf(timestamp, price, volume, 5, self.candles_5m)
+        candle_5m.high = max(candle_5m.high, price)
+        candle_5m.low = min(candle_5m.low, price)
+        candle_5m.close = price
+        candle_5m.volume += volume
+        if self._is_candle_closed_at(candle_5m, timestamp, 5):
+            self._finalize_candle(candle_5m)
+            closed_candle = candle_5m
+
+        # Build 15m candle
+        candle_15m = self._get_or_create_candle_for_tf(timestamp, price, volume, 15, self.candles_15m)
+        candle_15m.high = max(candle_15m.high, price)
+        candle_15m.low = min(candle_15m.low, price)
+        candle_15m.close = price
+        candle_15m.volume += volume
+        if self._is_candle_closed_at(candle_15m, timestamp, 15):
+            self._finalize_candle(candle_15m)
+            closed_candle = candle_15m
+
+        # Build 1h candle
+        candle_1h = self._get_or_create_candle_for_tf(timestamp, price, volume, 60, self.candles_1h)
+        candle_1h.high = max(candle_1h.high, price)
+        candle_1h.low = min(candle_1h.low, price)
+        candle_1h.close = price
+        candle_1h.volume += volume
+        if self._is_candle_closed_at(candle_1h, timestamp, 60):
+            self._finalize_candle(candle_1h)
+            closed_candle = candle_1h
+
+        return closed_candle
+
+    def _get_or_create_candle_for_tf(self, ts: datetime, price: float, volume: int, minutes: int, candles: List[Candle]) -> Candle:
+        aligned_ts = ts.replace(minute=(ts.minute // minutes) * minutes, second=0, microsecond=0)
+        if not candles or aligned_ts > candles[-1].timestamp:
             candle = Candle(
-                timestamp=ts.replace(minute=(ts.minute // 15) * 15, second=0, microsecond=0),
+                timestamp=aligned_ts,
                 open=price, high=price, low=price, close=price, volume=volume
             )
-            self.candles_15m.append(candle)
+            candles.append(candle)
             return candle
-        return self.candles_15m[-1]
-    
-    def _is_new_candle_needed(self, ts: datetime, last: Candle) -> bool:
-        return ts >= last.timestamp + timedelta(minutes=15)
-    
-    def _is_candle_closed(self, candle: Candle, ts: datetime) -> bool:
-        from datetime import timedelta
-        return ts >= candle.timestamp + timedelta(minutes=15)
+        return candles[-1]
+
+    def _is_candle_closed_at(self, candle: Candle, ts: datetime, minutes: int) -> bool:
+        return ts >= candle.timestamp + timedelta(minutes=minutes)
     
     def _finalize_candle(self, candle: Candle):
         """Compute all indicators when candle closes."""

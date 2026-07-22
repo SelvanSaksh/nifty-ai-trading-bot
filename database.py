@@ -134,3 +134,28 @@ async def get_recent_trades(limit: int = 20) -> List[Trade]:
                 )
                 trades.append(trade)
             return trades
+
+async def get_recent_signals(limit: int = 20) -> List[Signal]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            signals = []
+            for row in rows:
+                signal = Signal(
+                    timestamp=datetime.fromisoformat(row["timestamp"]),
+                    direction=row["direction"],
+                    score=row["score"],
+                    confidence=row["confidence"],
+                    reasoning=row["reasoning"],
+                    stop_loss=row["stop_loss"],
+                    target_1=row["target_1"],
+                    target_2=row["target_2"],
+                    target_3=row["target_3"],
+                    risk_reward=row["risk_reward"],
+                    ht_filter_passed=bool(row["ht_filter_passed"])
+                )
+                signals.append(signal)
+            return signals

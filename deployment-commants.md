@@ -7,10 +7,10 @@ nano .env
 # Paste your credentials, save
 
 # 3. Build and start
-docker-compose up -d --build
+docker compose up -d --build
 
 # 4. Check logs
-docker-compose logs -f bot
+docker compose logs -f bot
 
 # 5. Health check
 curl http://localhost:8000/health

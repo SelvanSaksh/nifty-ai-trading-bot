@@ -8,7 +8,7 @@ from brokers.fyers_broker_mock import FyersBroker
 from analyzer import Analyzer
 from decision_engine import DecisionEngine
 from risk_manager import RiskManager
-from database import save_candle, save_signal, save_trade, get_recent_trades
+from database import save_candle, save_signal, save_trade, get_recent_trades, get_recent_signals
 from notifier import TelegramNotifier
 from models.candle import Candle
 from models.signal import Signal
@@ -50,6 +50,34 @@ class NiftyBot:
         connected = await self.broker.connect()
         if not connected:
             raise ConnectionError("Failed to connect to Fyers")
+        
+        # Fetch historical candles so chart has data immediately
+        try:
+            historical_15m = await self.broker.get_historical_candles(
+                symbol="NSE:NIFTY50-INDEX", timeframe="15", limit=200
+            )
+            self.analyzer.candles_15m = historical_15m
+            print(f"[BOT] Loaded {len(historical_15m)} x 15m candles")
+        except Exception as e:
+            print(f"[BOT] Failed to load 15m candles: {e}")
+
+        try:
+            historical_1h = await self.broker.get_historical_candles(
+                symbol="NSE:NIFTY50-INDEX", timeframe="60", limit=200
+            )
+            self.analyzer.candles_1h = historical_1h
+            print(f"[BOT] Loaded {len(historical_1h)} x 1h candles")
+        except Exception as e:
+            print(f"[BOT] Failed to load 1h candles: {e}")
+
+        try:
+            historical_5m = await self.broker.get_historical_candles(
+                symbol="NSE:NIFTY50-INDEX", timeframe="5", limit=200
+            )
+            self.analyzer.candles_5m = historical_5m
+            print(f"[BOT] Loaded {len(historical_5m)} x 5m candles")
+        except Exception as e:
+            print(f"[BOT] Failed to load 5m candles: {e}")
         
         self.broker.tick_callback = self._on_tick
         await self.broker.subscribe_ticks(["NSE:NIFTY50-INDEX"])
@@ -335,12 +363,16 @@ class NiftyBot:
         return await get_recent_trades(limit)
     
     async def get_recent_signals(self, limit: int = 20):
-        # Implement in database.py
-        return []
+        return await get_recent_signals(limit)
     
     async def get_candles(self, timeframe: str, limit: int):
-        # Implement in database.py
-        return []
+        if timeframe == "5m":
+            candles = self.analyzer.candles_5m
+        elif timeframe == "1h":
+            candles = self.analyzer.candles_1h
+        else:
+            candles = self.analyzer.candles_15m
+        return [c.model_dump() for c in candles[-limit:]]
     
     async def get_market_context(self):
         # NOW WITH await
