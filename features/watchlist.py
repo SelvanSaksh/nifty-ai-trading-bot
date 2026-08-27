@@ -81,21 +81,21 @@ class WatchlistManager:
     def __init__(self):
         self._watchlists: Dict[str, Watchlist] = {}
         self._default_symbols = [
-            ("NSE:NIFTY50-INDEX", "Nifty 50"),
-            ("NSE:NIFTYBANK-INDEX", "Bank Nifty"),
-            ("NSE:FINNIFTY-INDEX", "Fin Nifty"),
-            ("NSE:SENSEX-INDEX", "Sensex"),
-            ("NSE:RELIANCE-EQ", "Reliance"),
-            ("NSE:TCS-EQ", "TCS"),
-            ("NSE:INFY-EQ", "Infosys"),
-            ("NSE:HDFCBANK-EQ", "HDFC Bank"),
-            ("NSE:ICICIBANK-EQ", "ICICI Bank"),
-            ("NSE:SBIN-EQ", "SBI"),
-            ("NSE:BAJFINANCE-EQ", "Bajaj Finance"),
-            ("NSE:KOTAKBANK-EQ", "Kotak Bank"),
-            ("NSE:ITC-EQ", "ITC"),
-            ("NSE:HINDUNILVR-EQ", "Hindustan Unilever"),
-            ("NSE:LT-EQ", "L&T"),
+            ("NSE:NIFTY50-INDEX", "Nifty 50", "INDEX", "NSE"),
+            ("NSE:NIFTYBANK-INDEX", "Bank Nifty", "INDEX", "NSE"),
+            ("NSE:FINNIFTY-INDEX", "Fin Nifty", "INDEX", "NSE"),
+            ("NSE:SENSEX-INDEX", "Sensex", "INDEX", "NSE"),
+            ("NSE:RELIANCE-EQ", "Reliance", "EQUITY", "NSE"),
+            ("NSE:TCS-EQ", "TCS", "EQUITY", "NSE"),
+            ("NSE:INFY-EQ", "Infosys", "EQUITY", "NSE"),
+            ("NSE:HDFCBANK-EQ", "HDFC Bank", "EQUITY", "NSE"),
+            ("NSE:ICICIBANK-EQ", "ICICI Bank", "EQUITY", "NSE"),
+            ("NSE:SBIN-EQ", "SBI", "EQUITY", "NSE"),
+            ("NSE:BAJFINANCE-EQ", "Bajaj Finance", "EQUITY", "NSE"),
+            ("NSE:KOTAKBANK-EQ", "Kotak Bank", "EQUITY", "NSE"),
+            ("NSE:ITC-EQ", "ITC", "EQUITY", "NSE"),
+            ("NSE:HINDUNILVR-EQ", "Hindustan Unilever", "EQUITY", "NSE"),
+            ("NSE:LT-EQ", "L&T", "EQUITY", "NSE"),
         ]
     
     def create_default(self, user_id: str = "default") -> Watchlist:
@@ -105,8 +105,13 @@ class WatchlistManager:
             name="My Watchlist",
             user_id=user_id
         )
-        for symbol, name in self._default_symbols:
-            wl.add(WatchlistItem(symbol=symbol, name=name))
+        for symbol, name, instrument_type, exchange in self._default_symbols:
+            wl.add(WatchlistItem(
+                symbol=symbol,
+                name=name,
+                instrument_type=instrument_type,
+                exchange=exchange,
+            ))
         
         self._watchlists[wl.id] = wl
         return wl
