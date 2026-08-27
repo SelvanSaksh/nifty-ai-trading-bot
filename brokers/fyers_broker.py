@@ -134,7 +134,7 @@ class FyersBroker(BaseBroker):
             return {"s": "ok", "id": f"PAPER_{trade.id}", "message": "Paper trade"}
         
         order_data = {
-            "symbol": "NSE:NIFTY50-INDEX",
+            "symbol": trade.symbol,
             "qty": trade.quantity,
             "type": 2,
             "side": 1 if trade.direction.value == "LONG" else -1,

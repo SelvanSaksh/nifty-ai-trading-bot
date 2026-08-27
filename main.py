@@ -3,12 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
 
 from bot import NiftyBot
 from database import init_db
 from trading_mcp.server import mcp_app, set_bot_instance
 from config import settings, ensure_data_dir
 from fyers_auth import exchange_code_for_token, save_token
+from features.watchlist import watchlist_manager
 
 
 @asynccontextmanager
@@ -113,6 +115,8 @@ async def get_status():
         "active_trade": bot.active_trade.model_dump() if bot.active_trade else None,
         "paper_mode": settings.PAPER_TRADING,
         "today_pnl": round(bot.today_pnl, 2),
+        "symbol": bot.symbol,
+        "symbol_name": bot.symbol_name,
     }
 
 
@@ -156,6 +160,44 @@ async def get_candles(timeframe: str = "15m", limit: int = 100):
 @app.get("/api/market-context")
 async def get_market_context():
     return await app.state.bot.get_market_context()
+
+
+# ── Symbol Management ───────────────────────────────────────
+
+@app.get("/api/symbols")
+async def get_available_symbols():
+    """Return the list of available instruments for trading."""
+    default_wl = watchlist_manager.create_default("default")
+    return {
+        "symbols": [item.to_dict() for item in default_wl.items]
+    }
+
+
+class SetActiveSymbolRequest(BaseModel):
+    symbol: str
+    symbol_name: str = ""
+
+
+@app.get("/api/symbols/active")
+async def get_active_symbol():
+    """Return the currently active trading symbol."""
+    bot: NiftyBot = app.state.bot
+    return bot.get_symbol()
+
+
+@app.post("/api/symbols/active")
+async def set_active_symbol(request: SetActiveSymbolRequest):
+    """Set the active trading symbol. Stops and restarts the bot if running."""
+    bot: NiftyBot = app.state.bot
+    result = await bot.set_symbol(request.symbol, request.symbol_name)
+    return result
+
+
+@app.get("/api/watchlist")
+async def get_watchlist():
+    """Return all watchlist symbols with live quotes."""
+    bot: NiftyBot = app.state.bot
+    return {"quotes": bot.get_watchlist_quotes()}
 
 
 # ── Bot Control ─────────────────────────────────────────────────

@@ -40,6 +40,8 @@ class Trade(BaseModel):
     result: Optional[SignalResult] = None
     
     # Metadata
+    symbol: str = "NSE:NIFTY50-INDEX"
+    symbol_name: str = "Nifty 50"
     signal_score: int
     confidence: float
     paper_trade: bool = True

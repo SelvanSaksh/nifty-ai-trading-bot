@@ -68,6 +68,8 @@ class MCPTools:
             "active_trade": self._trade_to_dict(self.bot_instance.active_trade),
             "paper_mode": self.bot_instance.active_trade.paper_trade if self.bot_instance.active_trade else True,
             "today_pnl": round(self.bot_instance.today_pnl, 2),
+            "symbol": self.bot_instance.symbol,
+            "symbol_name": self.bot_instance.symbol_name,
             "websocket_clients": len(self.bot_instance.ws_clients),
         }
     

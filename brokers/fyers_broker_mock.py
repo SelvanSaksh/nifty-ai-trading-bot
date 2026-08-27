@@ -16,6 +16,25 @@ from config import settings
 class FyersBroker(BaseBroker):
     """Mock Fyers broker - simulates market data for testing."""
     
+    # Realistic starting prices for each symbol
+    _DEFAULT_PRICES: Dict[str, float] = {
+        "NSE:NIFTY50-INDEX": 24500.0,
+        "NSE:NIFTYBANK-INDEX": 51000.0,
+        "NSE:FINNIFTY-INDEX": 23000.0,
+        "NSE:SENSEX-INDEX": 81000.0,
+        "NSE:RELIANCE-EQ": 2950.0,
+        "NSE:TCS-EQ": 3800.0,
+        "NSE:INFY-EQ": 1650.0,
+        "NSE:HDFCBANK-EQ": 1700.0,
+        "NSE:ICICIBANK-EQ": 1250.0,
+        "NSE:SBIN-EQ": 820.0,
+        "NSE:BAJFINANCE-EQ": 7200.0,
+        "NSE:KOTAKBANK-EQ": 1800.0,
+        "NSE:ITC-EQ": 460.0,
+        "NSE:HINDUNILVR-EQ": 2500.0,
+        "NSE:LT-EQ": 3400.0,
+    }
+    
     def __init__(self):
         self.is_connected = False
         self.tick_callback: Optional[Callable] = None
@@ -23,6 +42,7 @@ class FyersBroker(BaseBroker):
         self._running = False
         self._symbols: List[str] = []
         self._session: Optional[asyncio.Task] = None
+        self._symbol_prices: Dict[str, float] = {}
     
     async def connect(self) -> bool:
         self.is_connected = True
@@ -39,22 +59,30 @@ class FyersBroker(BaseBroker):
     async def subscribe_ticks(self, symbols: list[str]):
         self._symbols = symbols
         self._running = True
+        # Initialize per-symbol starting prices with realistic values
+        for sym in symbols:
+            if sym not in self._symbol_prices:
+                self._symbol_prices[sym] = self._DEFAULT_PRICES.get(sym, 24500.0)
         self._session = asyncio.create_task(self._generate_mock_ticks())
         print(f"[MOCK] Subscribed to: {symbols}")
     
     async def _generate_mock_ticks(self):
         """Generate simulated ticks every second."""
         while self._running and self.is_connected:
-            # Random walk price
-            self._price += random.uniform(-5, 5)
-            tick = {
-                "ltp": round(self._price, 2),
-                "v": random.randint(100, 1000),
-                "symbol": self._symbols[0] if self._symbols else "NSE:NIFTY50-INDEX"
-            }
-            
-            if self.tick_callback:
-                await self.tick_callback(tick)
+            for sym in self._symbols:
+                price = self._symbol_prices.get(sym, 24500.0)
+                # Volatility proportional to price level (~0.02% per tick)
+                volatility = max(price * 0.0002, 0.1)
+                price += random.uniform(-volatility, volatility)
+                self._symbol_prices[sym] = round(price, 2)
+                tick = {
+                    "ltp": round(price, 2),
+                    "v": random.randint(100, 5000),
+                    "symbol": sym
+                }
+                
+                if self.tick_callback:
+                    await self.tick_callback(tick)
             
             await asyncio.sleep(1)
     
@@ -66,7 +94,7 @@ class FyersBroker(BaseBroker):
     ) -> list[Candle]:
         """Generate mock historical candles."""
         candles = []
-        base_price = 24500.0
+        base_price = self._symbol_prices.get(symbol, 24500.0)
         
         for i in range(limit):
             ts = datetime.now() - timedelta(minutes=int(timeframe) * (limit - i))
@@ -85,6 +113,10 @@ class FyersBroker(BaseBroker):
                 timeframe=timeframe
             ))
             base_price = close
+        
+        # Update the stored price for this symbol to the last close
+        if candles:
+            self._symbol_prices[symbol] = candles[-1].close
         
         return candles
     

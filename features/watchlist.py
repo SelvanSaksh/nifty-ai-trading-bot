@@ -89,6 +89,13 @@ class WatchlistManager:
             ("NSE:TCS-EQ", "TCS"),
             ("NSE:INFY-EQ", "Infosys"),
             ("NSE:HDFCBANK-EQ", "HDFC Bank"),
+            ("NSE:ICICIBANK-EQ", "ICICI Bank"),
+            ("NSE:SBIN-EQ", "SBI"),
+            ("NSE:BAJFINANCE-EQ", "Bajaj Finance"),
+            ("NSE:KOTAKBANK-EQ", "Kotak Bank"),
+            ("NSE:ITC-EQ", "ITC"),
+            ("NSE:HINDUNILVR-EQ", "Hindustan Unilever"),
+            ("NSE:LT-EQ", "L&T"),
         ]
     
     def create_default(self, user_id: str = "default") -> Watchlist:

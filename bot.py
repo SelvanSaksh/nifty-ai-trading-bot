@@ -15,6 +15,7 @@ from models.signal import Signal
 from models.trade import Trade
 from models.enums import Direction, TradeStatus, SignalResult
 from config import settings
+from features.watchlist import watchlist_manager
 
 
 class NiftyBot:
@@ -32,8 +33,15 @@ class NiftyBot:
         self.active_trade: Optional[Trade] = None
         self.today_pnl = 0.0
         
+        self.symbol: str = settings.TRADING_SYMBOL
+        self.symbol_name: str = settings.TRADING_SYMBOL_NAME
+        
         self.ws_clients: List[WebSocket] = []
         self._tick_task: Optional[asyncio.Task] = None
+        
+        # Multi-symbol watchlist live quotes: {symbol: {ltp, change, change_pct, open, high, low, volume, name, instrument_type}}
+        self.watchlist_quotes: Dict[str, Dict[str, Any]] = {}
+        self._all_symbols: List[str] = []
     
     @property
     def uptime(self) -> str:
@@ -54,16 +62,16 @@ class NiftyBot:
         # Fetch historical candles so chart has data immediately
         try:
             historical_15m = await self.broker.get_historical_candles(
-                symbol="NSE:NIFTY50-INDEX", timeframe="15", limit=200
+                symbol=self.symbol, timeframe="15", limit=200
             )
             self.analyzer.candles_15m = historical_15m
-            print(f"[BOT] Loaded {len(historical_15m)} x 15m candles")
+            print(f"[BOT] Loaded {len(historical_15m)} x 15m candles for {self.symbol}")
         except Exception as e:
             print(f"[BOT] Failed to load 15m candles: {e}")
 
         try:
             historical_1h = await self.broker.get_historical_candles(
-                symbol="NSE:NIFTY50-INDEX", timeframe="60", limit=200
+                symbol=self.symbol, timeframe="60", limit=200
             )
             self.analyzer.candles_1h = historical_1h
             print(f"[BOT] Loaded {len(historical_1h)} x 1h candles")
@@ -72,7 +80,7 @@ class NiftyBot:
 
         try:
             historical_5m = await self.broker.get_historical_candles(
-                symbol="NSE:NIFTY50-INDEX", timeframe="5", limit=200
+                symbol=self.symbol, timeframe="5", limit=200
             )
             self.analyzer.candles_5m = historical_5m
             print(f"[BOT] Loaded {len(historical_5m)} x 5m candles")
@@ -80,11 +88,19 @@ class NiftyBot:
             print(f"[BOT] Failed to load 5m candles: {e}")
         
         self.broker.tick_callback = self._on_tick
-        await self.broker.subscribe_ticks(["NSE:NIFTY50-INDEX"])
+        
+        # Subscribe to ALL watchlist symbols for live watchlist data
+        default_wl = watchlist_manager.create_default("default")
+        self._all_symbols = [item.symbol for item in default_wl.items]
+        # Ensure active symbol is included
+        if self.symbol not in self._all_symbols:
+            self._all_symbols.append(self.symbol)
+        await self.broker.subscribe_ticks(self._all_symbols)
+        print(f"[BOT] Subscribed to {len(self._all_symbols)} symbols for watchlist")
         
         self.is_running = True
         self.start_time = datetime.now()
-        await self.notifier.send("🚀 Nifty 50 AI Bot started (Paper: {})".format(settings.PAPER_TRADING))
+        await self.notifier.send(f"🚀 {self.symbol_name} AI Bot started for {self.symbol} (Paper: {settings.PAPER_TRADING})")
     
     async def stop(self):
         """Stop the bot engine."""
@@ -92,22 +108,73 @@ class NiftyBot:
         await self.broker.disconnect()
         if self.active_trade:
             await self._emergency_exit("Bot stopped")
-        await self.notifier.send("🛑 Nifty 50 AI Bot stopped")
+        await self.notifier.send(f"🛑 {self.symbol_name} AI Bot stopped")
+    
+    async def set_symbol(self, symbol: str, symbol_name: str = "") -> dict:
+        """Change the active trading symbol. Restarts subscriptions."""
+        if symbol == self.symbol:
+            return {"message": "Symbol already active", "symbol": self.symbol, "symbol_name": self.symbol_name}
+        
+        was_running = self.is_running
+        if was_running:
+            await self.stop()
+        
+        self.symbol = symbol
+        self.symbol_name = symbol_name or symbol.split(":")[-1].replace("-INDEX", "").replace("-EQ", "")
+        
+        # Ensure new symbol is in the all-symbols list
+        if symbol not in self._all_symbols:
+            self._all_symbols.append(symbol)
+        
+        if was_running:
+            await self.start()
+        
+        return {
+            "message": f"Symbol changed to {self.symbol_name}",
+            "symbol": self.symbol,
+            "symbol_name": self.symbol_name
+        }
+    
+    def get_symbol(self) -> dict:
+        """Get the current active symbol info."""
+        return {
+            "symbol": self.symbol,
+            "symbol_name": self.symbol_name
+        }
     
     async def _on_tick(self, tick: dict):
         """Handle incoming tick from Fyers WebSocket."""
-        if not self.is_running:
-            return
-        
-        # Parse tick
+        tick_symbol = tick.get("symbol", self.symbol)
         price = tick.get("ltp", 0)
         volume = tick.get("v", 0)
         timestamp = datetime.now()
         
+        # Always update watchlist quotes regardless of bot state
+        self._update_watchlist_quote(tick_symbol, price, volume, timestamp)
+        
+        # Broadcast watchlist tick to all clients
+        quote = self.watchlist_quotes.get(tick_symbol, {})
+        await self._broadcast({
+            "type": "watchlist_tick",
+            "symbol": tick_symbol,
+            "ltp": price,
+            "change": quote.get("change", 0),
+            "change_pct": quote.get("change_pct", 0),
+            "open": quote.get("open", price),
+            "high": quote.get("high", price),
+            "low": quote.get("low", price),
+            "volume": volume,
+            "timestamp": timestamp.isoformat(),
+        })
+        
+        # Only process candle building / trade logic for the active trading symbol when running
+        if not self.is_running or tick_symbol != self.symbol:
+            return
+        
         # Build candles
         closed_candle = self.analyzer.add_tick(price, volume, timestamp)
         
-        # Broadcast live candle to Flutter clients
+        # Broadcast live candle to Flutter clients (existing single-symbol chart data)
         await self._broadcast({
             "type": "tick",
             "price": price,
@@ -122,6 +189,32 @@ class NiftyBot:
         # If candle closed, run full analysis
         if closed_candle:
             await self._on_candle_close(closed_candle)
+    
+    def _update_watchlist_quote(self, symbol: str, price: float, volume: int, timestamp: datetime):
+        """Update the live quote for a symbol in the watchlist."""
+        if symbol in self.watchlist_quotes:
+            q = self.watchlist_quotes[symbol]
+            q["ltp"] = price
+            q["high"] = max(q.get("high", price), price)
+            q["low"] = min(q.get("low", price), price)
+            q["volume"] = volume
+            q["timestamp"] = timestamp.isoformat()
+            # Change from open
+            open_p = q.get("open", price)
+            q["change"] = round(price - open_p, 2)
+            q["change_pct"] = round((price - open_p) / open_p * 100, 2) if open_p else 0
+        else:
+            self.watchlist_quotes[symbol] = {
+                "symbol": symbol,
+                "ltp": price,
+                "open": price,
+                "high": price,
+                "low": price,
+                "change": 0,
+                "change_pct": 0,
+                "volume": volume,
+                "timestamp": timestamp.isoformat(),
+            }
     
     async def _on_candle_close(self, candle: Candle):
         """Full decision cycle on closed candle."""
@@ -179,6 +272,8 @@ class NiftyBot:
             target_1=signal.target_1,
             target_2=signal.target_2,
             target_3=signal.target_3,
+            symbol=self.symbol,
+            symbol_name=self.symbol_name,
             signal_score=signal.score,
             confidence=signal.confidence,
             paper_trade=settings.PAPER_TRADING
@@ -377,3 +472,25 @@ class NiftyBot:
     async def get_market_context(self):
         # NOW WITH await
         return await self.analyzer._get_market_context()
+    
+    def get_watchlist_quotes(self) -> list:
+        """Return live quotes for all watchlist symbols."""
+        default_wl = watchlist_manager.create_default("default")
+        result = []
+        for item in default_wl.items:
+            q = self.watchlist_quotes.get(item.symbol, {})
+            result.append({
+                "symbol": item.symbol,
+                "name": item.name,
+                "instrument_type": item.instrument_type,
+                "exchange": item.exchange,
+                "ltp": q.get("ltp", 0),
+                "change": q.get("change", 0),
+                "change_pct": q.get("change_pct", 0),
+                "open": q.get("open", 0),
+                "high": q.get("high", 0),
+                "low": q.get("low", 0),
+                "volume": q.get("volume", 0),
+                "is_active": item.symbol == self.symbol,
+            })
+        return result

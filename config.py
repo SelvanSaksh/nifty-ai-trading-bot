@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     FYERS_REFRESH_TOKEN: str = ""
     
     # ── Trading Configuration ───────────────────────────────────
+    TRADING_SYMBOL: str = "NSE:NIFTY50-INDEX"
+    TRADING_SYMBOL_NAME: str = "Nifty 50"
     PAPER_TRADING: bool = True
     CAPITAL: float = 100_000.0
     RISK_PER_TRADE: float = 0.01
