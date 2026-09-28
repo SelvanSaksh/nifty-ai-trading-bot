@@ -1,10 +1,10 @@
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
-import numpy as np
 
 from models.candle import Candle
 from models.enums import Direction
 from utils import indicators
+from utils.helpers import timeframe_label
 from utils.patterns import detect_candlestick_patterns
 from features.options import options_analyzer
 from features.news import news_monitor
@@ -58,7 +58,8 @@ class Analyzer:
         if not candles or aligned_ts > candles[-1].timestamp:
             candle = Candle(
                 timestamp=aligned_ts,
-                open=price, high=price, low=price, close=price, volume=volume
+                open=price, high=price, low=price, close=price, volume=volume,
+                timeframe=timeframe_label(minutes)
             )
             candles.append(candle)
             return candle
@@ -70,8 +71,6 @@ class Analyzer:
     def _finalize_candle(self, candle: Candle):
         """Compute all indicators when candle closes."""
         closes = [c.close for c in self.candles_15m]
-        highs = [c.high for c in self.candles_15m]
-        lows = [c.low for c in self.candles_15m]
         
         # Basic indicators
         candle.rsi = indicators.rsi(closes)
@@ -84,7 +83,7 @@ class Analyzer:
         candle.adx = indicators.adx(self.candles_15m)
         candle.bb_upper, candle.bb_lower = indicators.bollinger_bands(closes)
     
-    def analyze(self, candle: Candle) -> Dict[str, Any]:
+    async def analyze(self, candle: Candle) -> Dict[str, Any]:
         """Return complete analysis for decision engine."""
         closes = [c.close for c in self.candles_15m]
         patterns = detect_candlestick_patterns(self.candles_15m)
@@ -96,7 +95,7 @@ class Analyzer:
         order_block = self._detect_order_block()
         
         # Market context
-        market_context = self._get_market_context()
+        market_context = await self._get_market_context()
         
         return {
             "candle": candle,
@@ -132,7 +131,7 @@ class Analyzer:
         if len(self.candles_15m) < 3:
             return None
         
-        c1, c2, c3 = self.candles_15m[-3], self.candles_15m[-2], self.candles_15m[-1]
+        c1, _mid, c3 = self.candles_15m[-3], self.candles_15m[-2], self.candles_15m[-1]
         
         # Bullish FVG: c1.high < c3.low
         if c1.high < c3.low:
@@ -164,7 +163,7 @@ class Analyzer:
         if len(self.candles_15m) < 3:
             return None
         
-        c1, c2, c3 = self.candles_15m[-3], self.candles_15m[-2], self.candles_15m[-1]
+        c1, c2, _last = self.candles_15m[-3], self.candles_15m[-2], self.candles_15m[-1]
         
         # Bullish OB: strong bearish candle followed by strong bullish
         if c1.close < c1.open and c2.close > c2.open and c2.close > c1.open:

@@ -41,4 +41,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# ONE worker only: the trading engine must be a singleton (see utils/engine_lock.py).
+# Extra workers would each spin up their own engine/state; scale the API safely by
+# running additional containers — the engine lock elects exactly one leader.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

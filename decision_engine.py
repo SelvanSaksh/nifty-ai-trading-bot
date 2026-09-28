@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime
 from models.signal import Signal
 from models.enums import Direction
@@ -16,8 +16,6 @@ class DecisionEngine:
     def evaluate(self, analysis: Dict[str, Any]) -> Signal:
         """Score both directions and return the winning signal."""
         candle = analysis["candle"]
-        patterns = analysis["patterns"]
-        market_context = analysis["market_context"]
         ht_filter = analysis["higher_timeframe_trend"]
         
         long_score = self._score_long(analysis)
@@ -79,7 +77,7 @@ class DecisionEngine:
     def _score_long(self, analysis: Dict[str, Any]) -> int:
         """Score LONG setup (max ~100 points)."""
         candle = analysis["candle"]
-        patterns = analysis["patterns"]
+        patterns = analysis.get("patterns") or []
         score = 0
         
         # Trend alignment (max 25)
@@ -122,7 +120,7 @@ class DecisionEngine:
         # Advanced signals (max 15)
         if analysis.get("divergence") == "bullish_divergence":
             score += 8
-        if analysis.get("fvg", {}).get("type") == "bullish":
+        if (analysis.get("fvg") or {}).get("type") == "bullish":
             score += 4
         if analysis.get("liquidity_sweep") == "sweep_low":
             score += 3
@@ -132,7 +130,7 @@ class DecisionEngine:
     def _score_short(self, analysis: Dict[str, Any]) -> int:
         """Score SHORT setup (mirror of LONG)."""
         candle = analysis["candle"]
-        patterns = analysis["patterns"]
+        patterns = analysis.get("patterns") or []
         score = 0
         
         # Trend alignment (max 25)
@@ -174,7 +172,7 @@ class DecisionEngine:
         # Advanced signals (max 15)
         if analysis.get("divergence") == "bearish_divergence":
             score += 8
-        if analysis.get("fvg", {}).get("type") == "bearish":
+        if (analysis.get("fvg") or {}).get("type") == "bearish":
             score += 4
         if analysis.get("liquidity_sweep") == "sweep_high":
             score += 3
@@ -197,10 +195,17 @@ class DecisionEngine:
     
     def _build_reasoning(self, direction: Direction, score: int, analysis: Dict) -> str:
         candle = analysis["candle"]
+        patterns = analysis.get("patterns") or []
+        ht_filter = analysis.get("higher_timeframe_trend")
+        rsi = f"{candle.rsi:.1f}" if candle.rsi is not None else "n/a"
+        emas = "/".join(
+            f"{v:.1f}" if v is not None else "n/a"
+            for v in (candle.ema_20, candle.ema_50, candle.ema_200)
+        )
         return (
             f"{direction.value} signal scored {score}/100. "
-            f"Price: {candle.close}, RSI: {candle.rsi:.1f}, "
-            f"EMA20/50/200: {candle.ema_20:.1f}/{candle.ema_50:.1f}/{candle.ema_200:.1f}. "
-            f"Patterns: {', '.join(analysis['patterns'])}. "
-            f"HT filter: {analysis['higher_timeframe_trend'].value}."
+            f"Price: {candle.close}, RSI: {rsi}, "
+            f"EMA20/50/200: {emas}. "
+            f"Patterns: {', '.join(str(p) for p in patterns) or 'none'}. "
+            f"HT filter: {ht_filter.value if ht_filter else 'n/a'}."
         )

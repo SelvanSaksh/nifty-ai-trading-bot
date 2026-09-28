@@ -1,9 +1,65 @@
 """
 Utility helpers for time handling, math operations, and data validation.
 """
-import math
 from datetime import datetime, time, timedelta
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
+
+
+# ── Timeframe helpers ────────────────────────────────────────────
+
+# Canonical labels used across the API, the analyzer and the database.
+TIMEFRAME_ALIASES = {
+    "1": "1m", "1m": "1m",
+    "5": "5m", "5m": "5m",
+    "15": "15m", "15m": "15m",
+    "30": "30m", "30m": "30m",
+    "60": "1h", "60m": "1h", "1h": "1h",
+}
+
+# Broker (Fyers) resolution codes for each canonical timeframe.
+RESOLUTION_BY_TIMEFRAME = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60"}
+
+TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+
+# Timeframes that are built live from ticks; everything else is history-only.
+LIVE_TIMEFRAMES = ("5m", "15m", "1h")
+
+SUPPORTED_TIMEFRAMES = tuple(TIMEFRAME_MINUTES)
+
+
+def normalize_timeframe(value: str) -> str:
+    """
+    Normalize a user supplied timeframe to a canonical label.
+
+    Raises ValueError for anything unsupported — a request must never silently
+    fall back to a different timeframe, or the chart would show candles for a
+    period the user did not ask for.
+    """
+    key = str(value or "").strip().lower()
+    normalized = TIMEFRAME_ALIASES.get(key)
+    if normalized is None:
+        raise ValueError(
+            f"Unsupported timeframe '{value}'. Supported: {', '.join(SUPPORTED_TIMEFRAMES)}"
+        )
+    return normalized
+
+
+def timeframe_label(minutes: int) -> str:
+    """Canonical label for a timeframe given in minutes."""
+    return "1h" if minutes == 60 else f"{int(minutes)}m"
+
+
+def resolution_for(timeframe: str) -> str:
+    """Broker resolution code for a canonical (or alias) timeframe."""
+    return RESOLUTION_BY_TIMEFRAME[normalize_timeframe(timeframe)]
+
+
+def align_timestamp(ts: datetime, timeframe: str) -> datetime:
+    """Floor a timestamp to the opening boundary of its timeframe bar."""
+    minutes = TIMEFRAME_MINUTES[normalize_timeframe(timeframe)]
+    return ts.replace(
+        minute=(ts.minute // minutes) * minutes, second=0, microsecond=0
+    )
 
 
 def is_market_open(now: datetime = None) -> bool:
@@ -164,7 +220,7 @@ def format_pnl(pnl: float) -> str:
         return f"✅ +₹{pnl:,.2f}"
     elif pnl < 0:
         return f"❌ -₹{abs(pnl):,.2f}"
-    return f"➖ ₹0.00"
+    return "➖ ₹0.00"
 
 
 def format_number(num: Union[int, float], decimals: int = 2) -> str:

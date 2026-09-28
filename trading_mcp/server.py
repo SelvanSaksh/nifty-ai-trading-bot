@@ -54,10 +54,12 @@ async def list_tools():
             },
             {
                 "name": "get_candles",
-                "description": "OHLCV candles for chart analysis",
+                "description": "OHLCV candles for chart analysis. The response states which symbol the candles belong to; pass symbol to view an instrument other than the active one.",
                 "parameters": {
                     "timeframe": {"type": "string", "default": "15m"},
-                    "limit": {"type": "integer", "default": 50}
+                    "limit": {"type": "integer", "default": 50},
+                    "symbol": {"type": "string", "default": None,
+                               "description": "e.g. NSE:INFY-EQ. Defaults to the active trading symbol."}
                 },
                 "read_only": True
             },

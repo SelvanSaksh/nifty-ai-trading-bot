@@ -24,3 +24,7 @@ class Signal(BaseModel):
     risk_reward: float
     
     ht_filter_passed: bool = True
+
+    # Instrument the signal was generated for (history must stay unambiguous)
+    symbol: str = ""
+    symbol_name: str = ""

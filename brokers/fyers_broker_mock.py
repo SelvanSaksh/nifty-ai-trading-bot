@@ -52,12 +52,26 @@ class FyersBroker(BaseBroker):
     async def disconnect(self):
         self.is_connected = False
         self._running = False
-        if self._session:
+        if self._session and not self._session.done():
             self._session.cancel()
+            try:
+                await self._session
+            except asyncio.CancelledError:
+                pass
+        self._session = None
         print("[MOCK] Fyers disconnected")
     
     async def subscribe_ticks(self, symbols: list[str]):
-        self._symbols = symbols
+        # Cancel any previous tick loop — resubscribing must never stack
+        # generators on top of each other (that doubles every tick).
+        if self._session and not self._session.done():
+            self._session.cancel()
+            try:
+                await self._session
+            except asyncio.CancelledError:
+                pass
+
+        self._symbols = list(symbols)
         self._running = True
         # Initialize per-symbol starting prices with realistic values
         for sym in symbols:
@@ -90,19 +104,31 @@ class FyersBroker(BaseBroker):
         self, 
         symbol: str = "NSE:NIFTY50-INDEX", 
         timeframe: str = "15", 
-        limit: int = 100
+        limit: int = 100,
+        end_time: Optional[datetime] = None,
     ) -> list[Candle]:
-        """Generate mock historical candles."""
+        """Generate mock historical candles ending at ``end_time`` (default: now)."""
+        from utils.helpers import timeframe_label
+
+        minutes = int(timeframe) if str(timeframe).isdigit() else 15
+        label = timeframe_label(minutes)
+        end = end_time or datetime.now()
+
         candles = []
-        base_price = self._symbol_prices.get(symbol, 24500.0)
-        
+        # Fall back to the instrument's realistic base price, never a generic one.
+        base_price = self._symbol_prices.get(symbol) or self._DEFAULT_PRICES.get(symbol, 24500.0)
+
         for i in range(limit):
-            ts = datetime.now() - timedelta(minutes=int(timeframe) * (limit - i))
+            # Bars are aligned to their timeframe boundary, like real data.
+            ts = end - timedelta(minutes=minutes * (limit - 1 - i))
+            ts = ts.replace(second=0, microsecond=0)
+            ts = ts - timedelta(minutes=ts.minute % minutes)
+
             open_p = base_price + random.uniform(-50, 50)
             close = open_p + random.uniform(-30, 30)
             high = max(open_p, close) + random.uniform(0, 20)
             low = min(open_p, close) - random.uniform(0, 20)
-            
+
             candles.append(Candle(
                 timestamp=ts,
                 open=round(open_p, 2),
@@ -110,14 +136,12 @@ class FyersBroker(BaseBroker):
                 low=round(low, 2),
                 close=round(close, 2),
                 volume=random.randint(10000, 100000),
-                timeframe=timeframe
+                timeframe=label,
+                symbol=symbol,
             ))
             base_price = close
-        
-        # Update the stored price for this symbol to the last close
-        if candles:
-            self._symbol_prices[symbol] = candles[-1].close
-        
+
+        candles.sort(key=lambda c: c.timestamp)
         return candles
     
     async def place_order(self, trade: Trade) -> Dict[str, Any]:

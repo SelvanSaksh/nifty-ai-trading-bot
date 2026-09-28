@@ -10,6 +10,8 @@ class Candle(BaseModel):
     close: float
     volume: int
     timeframe: str = "15m"
+    symbol: str = ""
+    symbol_name: str = ""
     
     ema_20: Optional[float] = None
     ema_50: Optional[float] = None

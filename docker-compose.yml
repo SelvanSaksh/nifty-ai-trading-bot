@@ -45,6 +45,15 @@ services:
     
     ports:
       - "8000:8000"
+
+    # The API is up before the engine is (API-only mode on engine failure),
+    # so check /health rather than just the port.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     
     volumes:
       # Persist database and tokens across restarts
@@ -90,7 +99,8 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/ssl:/etc/nginx/ssl:ro
     depends_on:
-      - bot
+      bot:
+        condition: service_healthy
     networks:
       - bot_network
 

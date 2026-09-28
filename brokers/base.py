@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Optional, Dict, Any
 from models.trade import Trade
 from models.candle import Candle
@@ -20,8 +21,19 @@ class BaseBroker(ABC):
         pass
     
     @abstractmethod
-    async def get_historical_candles(self, symbol: str, timeframe: str, limit: int) -> list[Candle]:
-        """Fetch historical OHLCV data."""
+    async def get_historical_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        end_time: Optional[datetime] = None,
+    ) -> list[Candle]:
+        """
+        Fetch historical OHLCV data.
+
+        ``end_time`` (optional) bounds the window from above, so clients can
+        page backwards in history.  When omitted the window ends "now".
+        """
         pass
     
     @abstractmethod

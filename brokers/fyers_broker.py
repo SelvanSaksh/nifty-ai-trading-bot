@@ -3,7 +3,7 @@ import asyncio
 import aiohttp
 import json
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, Callable
 
 from brokers.base import BaseBroker
 from models.candle import Candle
@@ -21,6 +21,7 @@ class FyersBroker(BaseBroker):
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self.ws_task: Optional[asyncio.Task] = None
         self.tick_callback: Optional[Callable] = None
         self.is_connected = False
         self._headers = {}
@@ -33,6 +34,16 @@ class FyersBroker(BaseBroker):
             return token
         
         return f"{settings.FYERS_APP_ID}:{token}"
+    
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        """Return a live HTTP session, creating one on demand (REST-only calls)."""
+        if self.session is None or self.session.closed:
+            self._headers = {
+                "Authorization": self._get_auth_header(),
+                "Content-Type": "application/json"
+            }
+            self.session = aiohttp.ClientSession(headers=self._headers)
+        return self.session
     
     async def connect(self) -> bool:
         """Validate token by fetching profile."""
@@ -62,13 +73,31 @@ class FyersBroker(BaseBroker):
     
     async def disconnect(self):
         self.is_connected = False
+        if self.ws_task and not self.ws_task.done():
+            self.ws_task.cancel()
+            try:
+                await self.ws_task
+            except asyncio.CancelledError:
+                pass
+        self.ws_task = None
         if self.ws:
             await self.ws.close()
+            self.ws = None
         if self.session:
             await self.session.close()
+            self.session = None
     
     async def subscribe_ticks(self, symbols: list[str]):
-        """WebSocket tick subscription."""
+        """WebSocket tick subscription (replaces any previous subscription)."""
+        if self.ws_task and not self.ws_task.done():
+            # One subscription at a time — otherwise ticks arrive doubled after
+            # a symbol switch.
+            self.ws_task.cancel()
+            try:
+                await self.ws_task
+            except asyncio.CancelledError:
+                pass
+
         auth_token = self._get_auth_header()
         
         async def ws_listener():
@@ -91,18 +120,25 @@ class FyersBroker(BaseBroker):
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             break
         
-        asyncio.create_task(ws_listener())
+        self.ws_task = asyncio.create_task(ws_listener())
     
     async def get_historical_candles(
         self, 
         symbol: str = "NSE:NIFTY50-INDEX", 
         timeframe: str = "15", 
-        limit: int = 100
+        limit: int = 100,
+        end_time: Optional[datetime] = None,
     ) -> list[Candle]:
         """Fetch historical candles via REST."""
-        now = datetime.now()
-        from_date = (now - timedelta(days=limit // 2)).strftime("%Y-%m-%d")
-        to_date = now.strftime("%Y-%m-%d")
+        from utils.helpers import timeframe_label, TIMEFRAME_MINUTES
+
+        session = self._ensure_session()
+        end = end_time or datetime.now()
+        minutes = int(timeframe) if str(timeframe).isdigit() else TIMEFRAME_MINUTES.get(timeframe, 15)
+        label = timeframe_label(minutes)
+
+        from_date = (end - timedelta(days=max(limit // 2, 1))).strftime("%Y-%m-%d")
+        to_date = end.strftime("%Y-%m-%d")
         
         params = {
             "symbol": symbol,
@@ -113,7 +149,7 @@ class FyersBroker(BaseBroker):
             "cont_flag": "1"
         }
         
-        async with self.session.get(f"{self.DATA_URL}/history", params=params) as resp:
+        async with session.get(f"{self.DATA_URL}/history", params=params) as resp:
             data = await resp.json()
             candles = []
             
@@ -123,9 +159,17 @@ class FyersBroker(BaseBroker):
                         timestamp=datetime.fromtimestamp(c[0]),
                         open=c[1], high=c[2], low=c[3],
                         close=c[4], volume=c[5],
-                        timeframe=timeframe
+                        timeframe=label,
+                        symbol=symbol,
                     ))
             
+            if end_time is not None:
+                candles = [c for c in candles if c.timestamp <= end_time]
+
+            candles.sort(key=lambda c: c.timestamp)
+            if limit and len(candles) > limit:
+                candles = candles[-limit:]
+
             return candles
     
     async def place_order(self, trade: Trade) -> Dict[str, Any]:

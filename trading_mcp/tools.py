@@ -5,10 +5,8 @@ Exposes 10 structured tools for AI assistant integration.
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-from models.enums import Direction
 from features.portfolio import portfolio_tracker, Timeframe
 from features.journal_ai import trade_journal
-from features.watchlist import watchlist_manager
 
 
 class MCPTools:
@@ -124,13 +122,24 @@ class MCPTools:
         return signals
     
     # ── Tool 5: get_candles ─────────────────────────────────────
-    async def get_candles(self, timeframe: str = "15m", limit: int = 50) -> List[Dict[str, Any]]:
-        """OHLCV candles for chart analysis."""
+    async def get_candles(
+        self,
+        timeframe: str = "15m",
+        limit: int = 50,
+        symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        OHLCV candles for chart analysis.
+
+        Returns an envelope that always states which symbol the candles belong
+        to — pass ``symbol`` to inspect an instrument other than the active one.
+        """
         if not self.bot_instance:
-            return []
+            return {"error": "Bot not initialized"}
         
-        candles = await self.bot_instance.get_candles(timeframe, limit)
-        return candles
+        return await self.bot_instance.get_candles(
+            timeframe=timeframe, limit=limit, symbol=symbol
+        )
     
     # ── Tool 6: get_market_context ──────────────────────────────
     async def get_market_context(self) -> Dict[str, Any]:

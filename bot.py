@@ -1,6 +1,10 @@
 import asyncio
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 from fastapi import WebSocket
 
 from brokers.fyers_broker_mock import FyersBroker
@@ -8,7 +12,15 @@ from brokers.fyers_broker_mock import FyersBroker
 from analyzer import Analyzer
 from decision_engine import DecisionEngine
 from risk_manager import RiskManager
-from database import save_candle, save_signal, save_trade, get_recent_trades, get_recent_signals
+from database import (
+    save_candle,
+    save_signal,
+    save_trade,
+    get_recent_trades,
+    get_recent_signals,
+    get_active_symbol_state,
+    set_active_symbol_state,
+)
 from notifier import TelegramNotifier
 from models.candle import Candle
 from models.signal import Signal
@@ -16,132 +28,573 @@ from models.trade import Trade
 from models.enums import Direction, TradeStatus, SignalResult
 from config import settings
 from features.watchlist import watchlist_manager
+from utils.engine_lock import EngineLockedError, SingletonFileLock
+from utils.helpers import (
+    LIVE_TIMEFRAMES,
+    RESOLUTION_BY_TIMEFRAME,
+    normalize_timeframe,
+)
+
+# EXCHANGE:CODE, e.g. NSE:NIFTY50-INDEX or NSE:INFY-EQ
+SYMBOL_PATTERN = re.compile(r"^[A-Z]{2,12}:[A-Z0-9&\-\.]{1,40}$")
+
+
+class SymbolValidationError(ValueError):
+    """The requested symbol is malformed or not an available instrument."""
+
+
+class SymbolConflictError(Exception):
+    """The active trading symbol cannot change right now (open trade)."""
 
 
 class NiftyBot:
     """Main trading engine — tick loop, candle building, entry & exit."""
-    
+
+    # History cache for candles of instruments other than the active one.
+    HISTORY_LIMIT = 200
+    HISTORY_CACHE_TTL = 60.0
+    HISTORY_CACHE_MAX_ENTRIES = 32
+    # How often the engine checks the shared DB for symbol changes made by
+    # another process (single writer, shared state).
+    RECONCILE_INTERVAL = 5.0
+
     def __init__(self):
         self.broker = FyersBroker()
         self.analyzer = Analyzer()
         self.decision_engine = DecisionEngine()
         self.risk_manager = RiskManager()
         self.notifier = TelegramNotifier()
-        
+
         self.is_running = False
         self.start_time: Optional[datetime] = None
         self.active_trade: Optional[Trade] = None
         self.today_pnl = 0.0
-        
+
         self.symbol: str = settings.TRADING_SYMBOL
         self.symbol_name: str = settings.TRADING_SYMBOL_NAME
-        
+        # Version of the shared active-symbol state this engine has applied.
+        self.symbol_version = 0
+        self.symbol_changed_at: Optional[str] = None
+        self.symbol_changed_by: str = "default"
+        # Instrument the in-memory candle buffers actually belong to.
+        self.analyzer_symbol: Optional[str] = None
+
         self.ws_clients: List[WebSocket] = []
         self._tick_task: Optional[asyncio.Task] = None
-        
+
+        # Serializes start/stop/symbol-switch so they can never interleave.
+        self._lock = asyncio.Lock()
+        # Guarantees a single engine process across workers/replicas.
+        self._engine_lock = SingletonFileLock(Path(settings.DB_PATH).parent / "engine.lock")
+        self.engine_leader = False
+        self._reconcile_task: Optional[asyncio.Task] = None
+        self._pending_symbol_state: Optional[Dict[str, Any]] = None
+        self._history_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
         # Multi-symbol watchlist live quotes: {symbol: {ltp, change, change_pct, open, high, low, volume, name, instrument_type}}
         self.watchlist_quotes: Dict[str, Dict[str, Any]] = {}
         self._all_symbols: List[str] = []
-    
+
     @property
     def uptime(self) -> str:
         if not self.start_time:
             return "0:00:00"
         delta = datetime.now() - self.start_time
         return str(delta).split('.')[0]
-    
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+
     async def start(self):
-        """Start the bot engine."""
+        """Start the bot engine (only one process may ever run it)."""
+        async with self._lock:
+            await self._start_locked()
+
+    async def _start_locked(self):
         if self.is_running:
             return
-        
-        connected = await self.broker.connect()
-        if not connected:
-            raise ConnectionError("Failed to connect to Fyers")
-        
-        # Fetch historical candles so chart has data immediately
-        try:
-            historical_15m = await self.broker.get_historical_candles(
-                symbol=self.symbol, timeframe="15", limit=200
+
+        if not self._engine_lock.acquire():
+            raise EngineLockedError(
+                "Another process already runs the trading engine "
+                f"(lock: {self._engine_lock.path}). Only one engine is allowed: "
+                "multiple engines duplicate orders and desynchronize the active symbol."
             )
-            self.analyzer.candles_15m = historical_15m
-            print(f"[BOT] Loaded {len(historical_15m)} x 15m candles for {self.symbol}")
-        except Exception as e:
-            print(f"[BOT] Failed to load 15m candles: {e}")
+        self.engine_leader = True
 
         try:
-            historical_1h = await self.broker.get_historical_candles(
-                symbol=self.symbol, timeframe="60", limit=200
-            )
-            self.analyzer.candles_1h = historical_1h
-            print(f"[BOT] Loaded {len(historical_1h)} x 1h candles")
-        except Exception as e:
-            print(f"[BOT] Failed to load 1h candles: {e}")
+            connected = await self.broker.connect()
+            if not connected:
+                raise ConnectionError("Failed to connect to Fyers")
 
-        try:
-            historical_5m = await self.broker.get_historical_candles(
-                symbol=self.symbol, timeframe="5", limit=200
-            )
-            self.analyzer.candles_5m = historical_5m
-            print(f"[BOT] Loaded {len(historical_5m)} x 5m candles")
-        except Exception as e:
-            print(f"[BOT] Failed to load 5m candles: {e}")
-        
-        self.broker.tick_callback = self._on_tick
-        
-        # Subscribe to ALL watchlist symbols for live watchlist data
-        default_wl = watchlist_manager.create_default("default")
-        self._all_symbols = [item.symbol for item in default_wl.items]
-        # Ensure active symbol is included
-        if self.symbol not in self._all_symbols:
-            self._all_symbols.append(self.symbol)
-        await self.broker.subscribe_ticks(self._all_symbols)
-        print(f"[BOT] Subscribed to {len(self._all_symbols)} symbols for watchlist")
-        
-        self.is_running = True
-        self.start_time = datetime.now()
-        await self.notifier.send(f"🚀 {self.symbol_name} AI Bot started for {self.symbol} (Paper: {settings.PAPER_TRADING})")
-    
+            # Adopt the persisted active symbol (survives restarts) and load
+            # history for *that* symbol.
+            await self._sync_symbol_from_state()
+            await self._load_history_for(self.symbol)
+
+            self.broker.tick_callback = self._on_tick
+
+            # Subscribe to ALL watchlist symbols for live watchlist data
+            default_wl = watchlist_manager.create_default("default")
+            self._all_symbols = [item.symbol for item in default_wl.items]
+            if self.symbol not in self._all_symbols:
+                self._all_symbols.append(self.symbol)
+            await self.broker.subscribe_ticks(self._all_symbols)
+            print(f"[BOT] Subscribed to {len(self._all_symbols)} symbols for watchlist")
+
+            self.is_running = True
+            self.start_time = datetime.now()
+            self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+        except BaseException:
+            self.engine_leader = False
+            self._engine_lock.release()
+            raise
+
+        await self.notifier.send(
+            f"🚀 {self.symbol_name} AI Bot started for {self.symbol} "
+            f"(Paper: {settings.PAPER_TRADING}, symbol v{self.symbol_version})"
+        )
+
     async def stop(self):
         """Stop the bot engine."""
+        async with self._lock:
+            await self._stop_locked()
+
+    async def _stop_locked(self):
+        if self._reconcile_task is not None:
+            self._reconcile_task.cancel()
+            try:
+                await self._reconcile_task
+            except asyncio.CancelledError:
+                pass
+            self._reconcile_task = None
+
         self.is_running = False
+
+        if self.engine_leader:
+            self._engine_lock.release()
+            self.engine_leader = False
+
         await self.broker.disconnect()
         if self.active_trade:
             await self._emergency_exit("Bot stopped")
         await self.notifier.send(f"🛑 {self.symbol_name} AI Bot stopped")
-    
-    async def set_symbol(self, symbol: str, symbol_name: str = "") -> dict:
-        """Change the active trading symbol. Restarts subscriptions."""
+
+    # ── Active symbol ─────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_symbol_format(symbol: str):
+        if not symbol:
+            raise SymbolValidationError("symbol is required")
+        if not SYMBOL_PATTERN.match(symbol):
+            raise SymbolValidationError(
+                f"Invalid symbol '{symbol}'. Expected EXCHANGE:CODE, e.g. NSE:NIFTY50-INDEX"
+            )
+
+    @classmethod
+    def _validate_tradable_symbol(cls, symbol: str):
+        """Trading targets must be instruments we actually expose."""
+        cls._validate_symbol_format(symbol)
+        default_wl = watchlist_manager.create_default("default")
+        if default_wl.get(symbol) is None:
+            available = ", ".join(item.symbol for item in default_wl.items)
+            raise SymbolValidationError(
+                f"'{symbol}' is not in the watchlist. Available: {available}"
+            )
+
+    @staticmethod
+    def _derive_symbol_name(symbol: str) -> str:
+        default_wl = watchlist_manager.create_default("default")
+        item = default_wl.get(symbol)
+        if item is not None:
+            return item.name
+        name = symbol.split(":")[-1]
+        for suffix in ("-INDEX", "-EQ"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+        return name
+
+    def _symbol_name_for(self, symbol: str) -> str:
         if symbol == self.symbol:
-            return {"message": "Symbol already active", "symbol": self.symbol, "symbol_name": self.symbol_name}
-        
-        was_running = self.is_running
-        if was_running:
-            await self.stop()
-        
-        self.symbol = symbol
-        self.symbol_name = symbol_name or symbol.split(":")[-1].replace("-INDEX", "").replace("-EQ", "")
-        
-        # Ensure new symbol is in the all-symbols list
-        if symbol not in self._all_symbols:
-            self._all_symbols.append(symbol)
-        
-        if was_running:
-            await self.start()
-        
+            return self.symbol_name
+        return self._derive_symbol_name(symbol)
+
+    async def _sync_symbol_from_state(self):
+        """Adopt the shared active-symbol state (no history load, no broadcast)."""
+        state = await get_active_symbol_state()
+        self.symbol = state["symbol"]
+        self.symbol_name = state["symbol_name"]
+        self.symbol_version = state["version"]
+        self.symbol_changed_at = state["changed_at"]
+        self.symbol_changed_by = state["changed_by"]
+
+    async def _apply_symbol_state(
+        self,
+        state: Dict[str, Any],
+        reason: str,
+        broadcast: bool = True,
+    ) -> bool:
+        """
+        Make this engine trade the symbol stored in ``state``.
+
+        History for the new instrument is fetched *before* swapping, and the
+        swap itself contains no ``await`` — so no tick can ever be applied to
+        the wrong instrument's candle buffer.
+        """
+        new_symbol = state["symbol"]
+        new_name = state["symbol_name"]
+        if (
+            new_symbol == self.symbol
+            and new_name == self.symbol_name
+            and state["version"] == self.symbol_version
+        ):
+            return False
+
+        history: Optional[Dict[str, List[Candle]]] = None
+        try:
+            history = await self._fetch_history_bundle(new_symbol)
+        except Exception as exc:
+            print(f"[BOT] History load failed for {new_symbol}: {exc}")
+
+        old_symbol = self.symbol
+        self.symbol = new_symbol
+        self.symbol_name = new_name
+        self.symbol_version = state["version"]
+        self.symbol_changed_at = state.get("changed_at")
+        self.symbol_changed_by = state.get("changed_by", "system")
+
+        if history is None:
+            # Never keep another instrument's candles around.
+            self.analyzer.candles_5m = []
+            self.analyzer.candles_15m = []
+            self.analyzer.candles_1h = []
+        else:
+            self.analyzer.candles_5m = history["5m"]
+            self.analyzer.candles_15m = history["15m"]
+            self.analyzer.candles_1h = history["1h"]
+        self.analyzer_symbol = new_symbol
+        self._history_cache.clear()
+
+        if new_symbol not in self._all_symbols:
+            self._all_symbols.append(new_symbol)
+
+        if self.is_running:
+            await self.broker.subscribe_ticks(self._all_symbols)
+
+        if broadcast:
+            await self._broadcast({
+                "type": "symbol_changed",
+                "old_symbol": old_symbol,
+                "symbol": new_symbol,
+                "symbol_name": new_name,
+                "version": state["version"],
+                "changed_by": state.get("changed_by", "system"),
+                "reason": reason,
+                "timestamp": datetime.now().isoformat(),
+            })
+            await self.notifier.send(
+                f"🔁 Active symbol → {new_name} ({new_symbol}) "
+                f"[v{state['version']}, {reason}]"
+            )
+        return True
+
+    async def set_symbol(
+        self,
+        symbol: str,
+        symbol_name: str = "",
+        changed_by: str = "api",
+        reason: str = "api_request",
+    ) -> Dict[str, Any]:
+        """
+        Change the active trading symbol.
+
+        The new value is persisted (single shared source of truth) *and*
+        applied to this engine atomically under the lifecycle lock.
+        Raises SymbolValidationError / SymbolConflictError on refusal.
+        """
+        target = (symbol or "").strip().upper()
+        name = (symbol_name or "").strip() or self._derive_symbol_name(target)
+        self._validate_tradable_symbol(target)
+        if len(name) > 80:
+            raise SymbolValidationError("symbol_name must be 80 characters or fewer")
+
+        async with self._lock:
+            current = await get_active_symbol_state()
+            if target == current["symbol"] and name == current["symbol_name"]:
+                return {
+                    "message": "Symbol already active",
+                    **current,
+                    "in_sync": self.symbol_version == current["version"],
+                    "engine_leader": self.engine_leader,
+                    "bot_running": self.is_running,
+                }
+
+            if self.active_trade is not None:
+                raise SymbolConflictError(
+                    f"Cannot switch trading symbol while trade {self.active_trade.id} "
+                    f"is open on {self.active_trade.symbol}. Close it first."
+                )
+
+            state = await set_active_symbol_state(
+                target, name, updated_by=changed_by, reason=reason
+            )
+            await self._apply_symbol_state(state, reason=reason)
+
+            return {
+                "message": f"Symbol changed to {self.symbol_name}",
+                **state,
+                "in_sync": True,
+                "engine_leader": self.engine_leader,
+                "bot_running": self.is_running,
+            }
+
+    async def get_symbol(self) -> Dict[str, Any]:
+        """
+        Current active symbol, read from the shared state (identical answer in
+        every process) plus this engine's sync status.
+        """
+        state = await get_active_symbol_state()
+        in_sync = (not self.is_running) or (
+            state["version"] == self.symbol_version and state["symbol"] == self.symbol
+        )
         return {
-            "message": f"Symbol changed to {self.symbol_name}",
-            "symbol": self.symbol,
-            "symbol_name": self.symbol_name
+            **state,
+            "in_sync": in_sync,
+            "engine_leader": self.engine_leader,
+            "bot_running": self.is_running,
         }
-    
-    def get_symbol(self) -> dict:
-        """Get the current active symbol info."""
+
+    async def _reconcile_loop(self):
+        """Apply active-symbol changes written by other processes/workers."""
+        while True:
+            await asyncio.sleep(self.RECONCILE_INTERVAL)
+            try:
+                await self._reconcile_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[BOT] Symbol reconcile failed: {exc}")
+
+    async def _reconcile_once(self) -> bool:
+        if not self.is_running:
+            return False
+
+        state = await get_active_symbol_state()
+        if state["version"] == self.symbol_version and state["symbol"] == self.symbol:
+            return False
+
+        async with self._lock:
+            state = await get_active_symbol_state()
+            if state["version"] == self.symbol_version and state["symbol"] == self.symbol:
+                return False
+            if self.active_trade is not None:
+                # Defer instead of yanking the instrument out from a live trade.
+                self._pending_symbol_state = state
+                print(f"[BOT] Symbol switch deferred until {self.active_trade.id} closes")
+                return False
+            return await self._apply_symbol_state(state, reason="reconcile")
+
+    async def _apply_pending_symbol(self, state: Dict[str, Any]):
+        async with self._lock:
+            if self.active_trade is not None:
+                self._pending_symbol_state = state
+                return
+            self._pending_symbol_state = None
+            try:
+                await self._apply_symbol_state(state, reason="deferred_switch")
+            except Exception as exc:
+                print(f"[BOT] Deferred symbol switch failed: {exc}")
+
+    # ── Candles ───────────────────────────────────────────────────
+
+    def _series_for(self, tf: str) -> List[Candle]:
+        if tf == "5m":
+            return self.analyzer.candles_5m
+        if tf == "15m":
+            return self.analyzer.candles_15m
+        return self.analyzer.candles_1h
+
+    async def _load_history_for(self, symbol: str):
+        """Replace all candle buffers with history for ``symbol``."""
+        bundle = await self._fetch_history_bundle(symbol)
+        self.analyzer.candles_5m = bundle["5m"]
+        self.analyzer.candles_15m = bundle["15m"]
+        self.analyzer.candles_1h = bundle["1h"]
+        self.analyzer_symbol = symbol
+        print(
+            f"[BOT] Loaded {len(bundle['5m'])} x 5m, {len(bundle['15m'])} x 15m, "
+            f"{len(bundle['1h'])} x 1h candles for {symbol}"
+        )
+
+    async def _fetch_history_bundle(self, symbol: str) -> Dict[str, List[Candle]]:
+        bundle: Dict[str, List[Candle]] = {}
+        for tf in ("5m", "15m", "1h"):
+            try:
+                bundle[tf] = await self._fetch_history(
+                    symbol, tf, self.HISTORY_LIMIT, use_cache=False
+                )
+            except Exception as exc:
+                print(f"[BOT] Failed to load {tf} candles for {symbol}: {exc}")
+                bundle[tf] = []
+        if not any(bundle.values()):
+            raise RuntimeError(f"no history available for {symbol}")
+        return bundle
+
+    async def _fetch_history(
+        self,
+        symbol: str,
+        tf: str,
+        limit: int,
+        end_time: Optional[datetime] = None,
+        use_cache: bool = True,
+    ) -> List[Candle]:
+        cacheable = use_cache and end_time is None
+        key = (symbol, tf)
+
+        if cacheable:
+            entry = self._history_cache.get(key)
+            if (
+                entry is not None
+                and entry["expires"] > time.monotonic()
+                and len(entry["candles"]) >= limit
+            ):
+                return list(entry["candles"])
+
+        raw = await self.broker.get_historical_candles(
+            symbol=symbol,
+            timeframe=RESOLUTION_BY_TIMEFRAME[tf],
+            limit=limit,
+            end_time=end_time,
+        )
+
+        name = self._symbol_name_for(symbol)
+        candles: List[Candle] = []
+        for candle in raw:
+            candle.symbol = symbol
+            candle.symbol_name = name
+            candle.timeframe = tf
+            candles.append(candle)
+        candles.sort(key=lambda c: c.timestamp)
+
+        if cacheable:
+            self._history_cache[key] = {
+                "candles": candles,
+                "expires": time.monotonic() + self.HISTORY_CACHE_TTL,
+            }
+            if len(self._history_cache) > self.HISTORY_CACHE_MAX_ENTRIES:
+                oldest = min(self._history_cache, key=lambda k: self._history_cache[k]["expires"])
+                self._history_cache.pop(oldest, None)
+
+        return candles
+
+    async def get_candles(
+        self,
+        timeframe: str = "15m",
+        limit: int = 100,
+        symbol: Optional[str] = None,
+        end_time: Any = None,
+    ) -> Dict[str, Any]:
+        """
+        Candles for a specific instrument.
+
+        Without ``symbol`` the shared active symbol is used — but the response
+        always states which symbol the candles belong to, so a client can never
+        render data under the wrong label again.
+        """
+        tf = normalize_timeframe(timeframe)
+        limit = int(limit)
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        end_dt = self._parse_end_time(end_time)
+
+        active_state = await get_active_symbol_state()
+        if symbol:
+            target = str(symbol).strip().upper()
+            self._validate_symbol_format(target)
+            target_name = self._symbol_name_for(target)
+        else:
+            target = active_state["symbol"]
+            target_name = active_state["symbol_name"]
+
+        candles: List[Candle] = []
+        source = "history"
+        error: Optional[str] = None
+
+        live_ok = (
+            target == self.symbol
+            and self.analyzer_symbol == target
+            and tf in LIVE_TIMEFRAMES
+        )
+        if live_ok:
+            live = list(self._series_for(tf))
+            # Live buffers only help if they reach back to the requested window.
+            if live and (end_dt is None or live[0].timestamp <= end_dt):
+                candles, source = live, "live"
+
+        if not candles or (end_dt is not None and candles[0].timestamp > end_dt):
+            try:
+                fetch_limit = limit if end_dt is not None else max(limit, self.HISTORY_LIMIT)
+                candles = await self._fetch_history(target, tf, fetch_limit, end_time=end_dt)
+                source = "history"
+            except Exception as exc:
+                error = str(exc)
+                candles = []
+                source = "history"
+
+        if end_dt is not None:
+            candles = [c for c in candles if c.timestamp <= end_dt]
+        if candles:
+            candles = candles[-limit:]
+
+        payload = [
+            {
+                **c.model_dump(),
+                "symbol": target,
+                "symbol_name": target_name,
+                "timeframe": tf,
+            }
+            for c in candles
+        ]
+
         return {
-            "symbol": self.symbol,
-            "symbol_name": self.symbol_name
+            "symbol": target,
+            "symbol_name": target_name,
+            "symbol_version": active_state["version"],
+            "active_symbol": active_state["symbol"],
+            "timeframe": tf,
+            "limit": limit,
+            "source": source,
+            "count": len(payload),
+            "coverage": (
+                {"start": payload[0]["timestamp"], "end": payload[-1]["timestamp"]}
+                if payload
+                else None
+            ),
+            "error": error,
+            "candles": payload,
         }
-    
+
+    @staticmethod
+    def _parse_end_time(value: Any) -> Optional[datetime]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            text = str(value).strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(text)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid end_time '{value}'. Expected ISO-8601, e.g. 2026-09-27T15:30:00"
+                )
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+
+    # ── Tick handling ─────────────────────────────────────────────
+
     async def _on_tick(self, tick: dict):
         """Handle incoming tick from Fyers WebSocket."""
         tick_symbol = tick.get("symbol", self.symbol)
@@ -177,6 +630,8 @@ class NiftyBot:
         # Broadcast live candle to Flutter clients (existing single-symbol chart data)
         await self._broadcast({
             "type": "tick",
+            "symbol": self.symbol,
+            "symbol_version": self.symbol_version,
             "price": price,
             "timestamp": timestamp.isoformat(),
             "live_candle": self._candle_to_dict(self.analyzer.candles_15m[-1]) if self.analyzer.candles_15m else None
@@ -219,7 +674,7 @@ class NiftyBot:
     async def _on_candle_close(self, candle: Candle):
         """Full decision cycle on closed candle."""
         # Save candle to DB
-        await save_candle(candle)
+        await save_candle(candle, self.symbol)
         
         # Check if trading allowed — NOW WITH await
         can_trade, reason = await self.risk_manager.can_trade()
@@ -232,13 +687,15 @@ class NiftyBot:
             return
         
         # Run analysis
-        analysis = self.analyzer.analyze(candle)
+        analysis = await self.analyzer.analyze(candle)
         
         # Decision engine
         signal = self.decision_engine.evaluate(analysis)
+        signal.symbol = self.symbol
+        signal.symbol_name = self.symbol_name
         
         # Save signal
-        await save_signal(signal)
+        await save_signal(signal, self.symbol, self.symbol_name)
         await self._broadcast({
             "type": "signal",
             "signal": signal.model_dump()
@@ -288,6 +745,7 @@ class NiftyBot:
             
             msg = (
                 f"📊 {'PAPER' if settings.PAPER_TRADING else 'LIVE'} TRADE ENTERED\n"
+                f"Symbol: {trade.symbol_name} ({trade.symbol})\n"
                 f"Direction: {trade.direction.value}\n"
                 f"Entry: {trade.entry_price}\n"
                 f"Qty: {trade.quantity}\n"
@@ -396,6 +854,7 @@ class NiftyBot:
         emoji = "✅" if trade.result.value == "WIN" else "❌"
         msg = (
             f"{emoji} TRADE CLOSED ({reason})\n"
+            f"Symbol: {trade.symbol_name} ({trade.symbol})\n"
             f"Result: {trade.result.value}\n"
             f"Total PnL: {trade.realized_pnl:.2f}\n"
             f"Today's PnL: {self.today_pnl:.2f}"
@@ -404,6 +863,12 @@ class NiftyBot:
         await self._broadcast({"type": "trade_closed", "trade": trade.model_dump()})
         
         self.active_trade = None
+
+        # Apply a symbol switch that was deferred while this trade was open.
+        if self._pending_symbol_state is not None:
+            pending = self._pending_symbol_state
+            self._pending_symbol_state = None
+            asyncio.ensure_future(self._apply_pending_symbol(pending))
     
     def _calculate_pnl(self, trade: Trade, exit_price: float, qty: int) -> float:
         if trade.direction == Direction.LONG:
@@ -432,10 +897,15 @@ class NiftyBot:
             except:
                 disconnected.append(client)
         for client in disconnected:
-            self.ws_clients.remove(client)
+            if client in self.ws_clients:
+                self.ws_clients.remove(client)
     
     def _candle_to_dict(self, candle: Candle) -> dict:
-        return candle.model_dump()
+        return {
+            **candle.model_dump(),
+            "symbol": candle.symbol or self.symbol,
+            "symbol_name": candle.symbol_name or self.symbol_name,
+        }
     
     # ── MCP / API helpers ─────────────────────────────────────────
     async def get_trading_stats(self) -> dict:
@@ -459,15 +929,6 @@ class NiftyBot:
     
     async def get_recent_signals(self, limit: int = 20):
         return await get_recent_signals(limit)
-    
-    async def get_candles(self, timeframe: str, limit: int):
-        if timeframe == "5m":
-            candles = self.analyzer.candles_5m
-        elif timeframe == "1h":
-            candles = self.analyzer.candles_1h
-        else:
-            candles = self.analyzer.candles_15m
-        return [c.model_dump() for c in candles[-limit:]]
     
     async def get_market_context(self):
         # NOW WITH await
