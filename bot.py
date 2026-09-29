@@ -1,13 +1,14 @@
 import asyncio
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import WebSocket
 
-from brokers.fyers_broker_mock import FyersBroker
+from brokers.fyers_broker import FyersBroker
+from brokers.fyers_broker_mock import FyersBroker as MockFyersBroker
 
 from analyzer import Analyzer
 from decision_engine import DecisionEngine
@@ -59,7 +60,13 @@ class NiftyBot:
     RECONCILE_INTERVAL = 5.0
 
     def __init__(self):
-        self.broker = FyersBroker()
+        mode = settings.BROKER_MODE.strip().lower()
+        if mode == "fyers":
+            self.broker = FyersBroker()
+        elif mode == "mock":
+            self.broker = MockFyersBroker()
+        else:
+            raise ValueError("BROKER_MODE must be 'fyers' or 'mock'")
         self.analyzer = Analyzer()
         self.decision_engine = DecisionEngine()
         self.risk_manager = RiskManager()
@@ -99,7 +106,7 @@ class NiftyBot:
     def uptime(self) -> str:
         if not self.start_time:
             return "0:00:00"
-        delta = datetime.now() - self.start_time
+        delta = datetime.utcnow() - self.start_time
         return str(delta).split('.')[0]
 
     # ── Lifecycle ─────────────────────────────────────────────────
@@ -142,7 +149,7 @@ class NiftyBot:
             print(f"[BOT] Subscribed to {len(self._all_symbols)} symbols for watchlist")
 
             self.is_running = True
-            self.start_time = datetime.now()
+            self.start_time = datetime.utcnow()
             self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         except BaseException:
             self.engine_leader = False
@@ -527,7 +534,7 @@ class NiftyBot:
         if live_ok:
             live = list(self._series_for(tf))
             # Live buffers only help if they reach back to the requested window.
-            if live and (end_dt is None or live[0].timestamp <= end_dt):
+            if len(live) >= limit and (end_dt is None or live[0].timestamp <= end_dt):
                 candles, source = live, "live"
 
         if not candles or (end_dt is not None and candles[0].timestamp > end_dt):
@@ -590,7 +597,7 @@ class NiftyBot:
                     f"Invalid end_time '{value}'. Expected ISO-8601, e.g. 2026-09-27T15:30:00"
                 )
         if dt.tzinfo is not None:
-            dt = dt.astimezone().replace(tzinfo=None)
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
         return dt
 
     # ── Tick handling ─────────────────────────────────────────────
@@ -600,7 +607,9 @@ class NiftyBot:
         tick_symbol = tick.get("symbol", self.symbol)
         price = tick.get("ltp", 0)
         volume = tick.get("v", 0)
-        timestamp = datetime.now()
+        # Candles are stored as naïve UTC by API contract. Never use the
+        # host's local clock here: that shifts bar boundaries and indicators.
+        timestamp = datetime.utcnow()
         
         # Always update watchlist quotes regardless of bot state
         self._update_watchlist_quote(tick_symbol, price, volume, timestamp)

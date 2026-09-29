@@ -12,6 +12,9 @@ def _offline_news(monkeypatch):
         self._last_fetch = datetime.now()
 
     monkeypatch.setattr("features.news.NewsMonitor._fetch_news", _noop)
+    # Tests must stay deterministic and offline. Production defaults to Fyers.
+    from config import settings
+    monkeypatch.setattr(settings, "BROKER_MODE", "mock")
 
 
 @pytest.fixture()

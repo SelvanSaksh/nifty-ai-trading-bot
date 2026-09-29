@@ -28,9 +28,17 @@ class FyersBroker(BaseBroker):
     
     def _get_auth_header(self) -> str:
         token = settings.FYERS_ACCESS_TOKEN
+        if not token:
+            # The OAuth callback persists the full token locally. Prefer an
+            # explicitly configured environment value, then recover that token
+            # for normal local restarts without falling back to fake prices.
+            from fyers_auth import load_token
+            token, _ = load_token()
+        if not token:
+            return ""
         
         # If token doesn't start with app_id, prepend it
-        if token.startswith(settings.FYERS_APP_ID):
+        if not settings.FYERS_APP_ID or token.startswith(settings.FYERS_APP_ID):
             return token
         
         return f"{settings.FYERS_APP_ID}:{token}"
@@ -133,7 +141,10 @@ class FyersBroker(BaseBroker):
         from utils.helpers import timeframe_label, TIMEFRAME_MINUTES
 
         session = self._ensure_session()
-        end = end_time or datetime.now()
+        # The REST endpoint uses epoch UTC timestamps. Keep every internal
+        # candle timestamp in naïve UTC because that is the API's documented
+        # JSON contract to the web client.
+        end = end_time or datetime.utcnow()
         minutes = int(timeframe) if str(timeframe).isdigit() else TIMEFRAME_MINUTES.get(timeframe, 15)
         label = timeframe_label(minutes)
 
@@ -156,7 +167,7 @@ class FyersBroker(BaseBroker):
             if data.get("s") == "ok":
                 for c in data.get("candles", []):
                     candles.append(Candle(
-                        timestamp=datetime.fromtimestamp(c[0]),
+                        timestamp=datetime.utcfromtimestamp(c[0]),
                         open=c[1], high=c[2], low=c[3],
                         close=c[4], volume=c[5],
                         timeframe=label,

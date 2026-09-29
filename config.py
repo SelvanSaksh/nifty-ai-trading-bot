@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     FYERS_REDIRECT_URI: str = "http://127.0.0.1:8000/api/auth/callback"
     FYERS_ACCESS_TOKEN: str = ""
     FYERS_REFRESH_TOKEN: str = ""
+    # Real market data is the production default. The mock broker is only for
+    # local demos and tests; it generates random candles and must never power a
+    # chart intended to match an exchange chart.
+    BROKER_MODE: str = "fyers"
     
     # ── Trading Configuration ───────────────────────────────────
     TRADING_SYMBOL: str = "NSE:NIFTY50-INDEX"

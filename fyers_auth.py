@@ -60,6 +60,41 @@ def is_token_valid(token: str, expires_at: Optional[datetime]) -> bool:
     return datetime.now() < (expires_at - timedelta(days=1))
 
 
+def auth_status() -> dict:
+    """Return safe token state for the web client; never expose the token."""
+    if settings.FYERS_ACCESS_TOKEN:
+        return {
+            "authenticated": True,
+            "source": "environment",
+            "expires_at": None,
+            "reason": None,
+            "login_available": bool(settings.FYERS_APP_ID and settings.FYERS_SECRET),
+        }
+
+    token, expires_at = load_token()
+    valid = is_token_valid(token, expires_at)
+    return {
+        "authenticated": valid,
+        "source": "file" if token else None,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "reason": None if valid else ("Fyers token expired" if token else "Fyers token missing"),
+        "login_available": bool(settings.FYERS_APP_ID and settings.FYERS_SECRET),
+    }
+
+
+def get_auth_url() -> str:
+    """Build the OAuth login URL for both the API redirect and CLI helper."""
+    if not settings.FYERS_APP_ID or not settings.FYERS_SECRET:
+        raise ValueError("FYERS_APP_ID and FYERS_SECRET must be configured")
+    return (
+        f"{FYERS_API_URL}/generate-authcode"
+        f"?client_id={settings.FYERS_APP_ID}"
+        f"&redirect_uri={settings.FYERS_REDIRECT_URI}"
+        f"&response_type=code"
+        f"&state=niftybot"
+    )
+
+
 async def validate_token(token: str) -> bool:
     """Validate token by fetching profile via HTTP."""
     headers = {"Authorization": token}
@@ -75,20 +110,11 @@ async def validate_token(token: str) -> bool:
 
 def generate_auth_url() -> str:
     """Generate Fyers login URL."""
-    if not settings.FYERS_APP_ID or not settings.FYERS_SECRET:
-        print("❌ Error: FYERS_APP_ID and FYERS_SECRET must be set in .env")
+    try:
+        return get_auth_url()
+    except ValueError as exc:
+        print(f"❌ Error: {exc}")
         sys.exit(1)
-    
-    # client_id must be the full APP_ID with -100 suffix
-    auth_url = (
-        f"{FYERS_API_URL}/generate-authcode"
-        f"?client_id={settings.FYERS_APP_ID}"
-        f"&redirect_uri={settings.FYERS_REDIRECT_URI}"
-        f"&response_type=code"
-        f"&state=niftybot"
-    )
-    
-    return auth_url
 
 
 async def exchange_code_for_token(auth_code: str) -> str:

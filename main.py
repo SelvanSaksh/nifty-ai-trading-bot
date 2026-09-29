@@ -1,7 +1,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -11,7 +11,7 @@ from bot import NiftyBot, SymbolConflictError, SymbolValidationError
 from database import init_db, get_active_symbol_state, get_symbol_change_history
 from trading_mcp.server import mcp_app, set_bot_instance
 from config import settings, ensure_data_dir
-from fyers_auth import exchange_code_for_token, save_token
+from fyers_auth import auth_status, exchange_code_for_token, get_auth_url, save_token
 from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError
 
@@ -98,6 +98,21 @@ async def health_check():
         "websocket_clients": len(bot.ws_clients),
         "startup_error": getattr(app.state, "startup_error", None),
     }
+
+
+@app.get("/api/auth/status")
+async def get_auth_status():
+    """Safe Fyers session state for clients that need to reconnect."""
+    return auth_status()
+
+
+@app.get("/api/auth/login")
+async def begin_fyers_login():
+    """Send the browser to Fyers when a token is missing or expired."""
+    try:
+        return RedirectResponse(get_auth_url(), status_code=307)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 # ── Fyers Auth Callback ─────────────────────────────────────────
