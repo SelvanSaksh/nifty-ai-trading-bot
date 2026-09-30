@@ -49,6 +49,9 @@ class FakeSession:
     def get(self, *args, **kwargs):
         return self._response
 
+    def post(self, *args, **kwargs):
+        return self._response
+
 
 def _patch_http(monkeypatch, response: FakeResponse):
     """Route every `aiohttp.ClientSession` use in fyers_auth to a canned reply."""
@@ -94,6 +97,38 @@ class TestVerifyToken:
 
         assert await fyers_auth.verify_token("APP:expired", force=True) is False
         assert len(calls) == 2, "force=True must talk to Fyers again"
+
+
+class TestTokenExchange:
+    """The callback runs inside uvicorn: a bad code must not take it down."""
+
+    async def test_a_rejected_code_raises_instead_of_exiting(self, monkeypatch, capsys):
+        _patch_http(
+            monkeypatch,
+            FakeResponse(
+                401,
+                '{"s":"error"}',
+                {"s": "error", "code": 500, "message": "Invalid auth code"},
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Invalid auth code"):
+            await fyers_auth.exchange_code_for_token("bad-code")
+
+        assert "Invalid auth code" in capsys.readouterr().out
+
+    async def test_the_access_token_is_returned_and_never_logged(
+        self, monkeypatch, capsys
+    ):
+        _patch_http(
+            monkeypatch,
+            FakeResponse(200, '{"s":"ok"}', {"s": "ok", "access_token": "SECRET-TOKEN"}),
+        )
+
+        token = await fyers_auth.exchange_code_for_token("good-code")
+
+        assert token == "SECRET-TOKEN"
+        assert "SECRET-TOKEN" not in capsys.readouterr().out
 
 
 class TestAuthStatus:

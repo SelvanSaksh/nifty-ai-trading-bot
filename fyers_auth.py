@@ -281,31 +281,42 @@ def generate_auth_url() -> str:
 
 
 async def exchange_code_for_token(auth_code: str) -> str:
-    """Exchange authorization code for access token."""
-    # Generate appIdHash: SHA256 of "app_id:secret" (full app id incl. -200 suffix)
-    app_id_hash = hashlib.sha256(f"{settings.FYERS_APP_ID}:{settings.FYERS_SECRET}".encode()).hexdigest()
-    
-    # ✅ Define payload BEFORE using it
+    """Exchange authorization code for access token.
+
+    Raises on failure rather than calling ``sys.exit``: this runs inside the
+    web server, and ``SystemExit`` is a ``BaseException``, so it would slip
+    past the callback's ``except Exception`` and kill the process.
+    """
+    # SHA256 of "app_id:secret" (full app id incl. the -100/-200 suffix).
+    app_id_hash = hashlib.sha256(
+        f"{settings.FYERS_APP_ID}:{settings.FYERS_SECRET}".encode()
+    ).hexdigest()
     payload = {
         "grant_type": "authorization_code",
         "appIdHash": app_id_hash,
-        "code": auth_code
+        "code": auth_code,
     }
-    
+
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{FYERS_API_URL}/validate-authcode",
             json=payload,
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/json"},
         ) as resp:
-            data = await resp.json()
-            print(f"Token response: {data}")
-            
-            if data.get("s") != "ok":
-                print(f"❌ Token generation failed: {data}")
-                sys.exit(1)
-            
-            return data["access_token"]
+            # Fyers sometimes answers with the wrong content type.
+            data = await resp.json(content_type=None)
+
+    if data.get("s") != "ok":
+        # The body also carries access_token/refresh_token — log status only.
+        print(
+            f"[AUTH] token exchange failed: s={data.get('s')} "
+            f"code={data.get('code')} message={data.get('message')}"
+        )
+        raise RuntimeError(
+            f"Fyers rejected the authorization code: {data.get('message') or data.get('code')}"
+        )
+
+    return data["access_token"]
 
 
 async def main():

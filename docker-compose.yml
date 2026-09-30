@@ -14,6 +14,9 @@ services:
       - FYERS_SECRET=${FYERS_SECRET}
       - FYERS_ACCESS_TOKEN=${FYERS_ACCESS_TOKEN}
       - FYERS_REDIRECT_URI=${FYERS_REDIRECT_URI:-https://api.trading.quantumvora.com/api/auth/callback}
+      # Terminal origin: without it the OAuth callback refuses `return_to` and
+      # lands on a bare "Auth Successful" page instead of the terminal.
+      - FRONTEND_URL=${FRONTEND_URL:-}
       
       # Trading config
       - BROKER_MODE=${BROKER_MODE:-fyers}
