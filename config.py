@@ -10,9 +10,12 @@ class Settings(BaseSettings):
     # ── Fyers API Credentials ───────────────────────────────────
     FYERS_APP_ID: str = ""
     FYERS_SECRET: str = ""
-    FYERS_REDIRECT_URI: str = "http://127.0.0.1:8000/api/auth/callback"
+    FYERS_REDIRECT_URI: str = "https://api.trading.quantumvora.com/api/auth/callback"
     FYERS_ACCESS_TOKEN: str = ""
     FYERS_REFRESH_TOKEN: str = ""
+    # FYERS API v3 production host (FYERS has no sandbox; this is the live
+    # endpoint used by the official SDK for trading and market data).
+    FYERS_API_URL: str = "https://api-t1.fyers.in/api/v3"
     # Real market data is the production default. The mock broker is only for
     # local demos and tests; it generates random candles and must never power a
     # chart intended to match an exchange chart.

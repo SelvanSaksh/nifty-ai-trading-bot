@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Fyers Authentication — Generates access token valid for 15 days.
 Uses official Fyers API endpoints.
@@ -10,7 +9,7 @@ import webbrowser
 import asyncio
 import aiohttp
 import hashlib
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, quote
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
@@ -19,7 +18,16 @@ from config import settings
 
 
 FYERS_TOKEN_FILE = "data/fyers_token.txt"
-FYERS_API_URL = "https://api-t1.fyers.in/api/v3"
+FYERS_API_URL = settings.FYERS_API_URL
+
+
+def _belongs_to_current_app(token: str) -> bool:
+    """Reject tokens minted for a different Fyers app (stale credentials)."""
+    if not token or ":" not in token:
+        return True
+    if not settings.FYERS_APP_ID:
+        return True
+    return token.split(":", 1)[0] == settings.FYERS_APP_ID
 
 
 def save_token(token: str):
@@ -42,7 +50,11 @@ def load_token() -> Tuple[str, Optional[datetime]]:
     
     token = lines[0].strip()
     expires_at = None
-    
+
+    if not _belongs_to_current_app(token):
+        # Minted for another app id — unusable against the configured app.
+        return "", None
+
     for line in lines[1:]:
         if line.startswith("expires_at:"):
             try:
@@ -89,7 +101,7 @@ def get_auth_url() -> str:
     return (
         f"{FYERS_API_URL}/generate-authcode"
         f"?client_id={settings.FYERS_APP_ID}"
-        f"&redirect_uri={settings.FYERS_REDIRECT_URI}"
+        f"&redirect_uri={quote(settings.FYERS_REDIRECT_URI, safe='')}"
         f"&response_type=code"
         f"&state=niftybot"
     )
@@ -119,7 +131,7 @@ def generate_auth_url() -> str:
 
 async def exchange_code_for_token(auth_code: str) -> str:
     """Exchange authorization code for access token."""
-    # Generate appIdHash: SHA256 of app_id:secret (full app_id with -100)
+    # Generate appIdHash: SHA256 of "app_id:secret" (full app id incl. -200 suffix)
     app_id_hash = hashlib.sha256(f"{settings.FYERS_APP_ID}:{settings.FYERS_SECRET}".encode()).hexdigest()
     
     # ✅ Define payload BEFORE using it
@@ -203,7 +215,7 @@ async def main():
     print("\n🔐 Step 3: Exchanging for access token...")
     access_token = await exchange_code_for_token(auth_code)
     
-    # Build full token with app_id prefix (WITH -100)
+    # Build full token with the app id prefix (e.g. 77M2C2QWOQ-200:<jwt>)
     full_token = f"{settings.FYERS_APP_ID}:{access_token}"
     
     print("\n🔐 Step 4: Validating...")

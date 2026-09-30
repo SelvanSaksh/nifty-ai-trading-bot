@@ -60,7 +60,10 @@ def test_switch_updates_candles_and_stays_stable(client):
         assert state["symbol"] == "NSE:INFY-EQ"
         assert state["version"] == changed["version"]
 
-        candles = client.get("/api/candles", params={"limit": 10})
+        candles = client.get(
+            "/api/candles",
+            params={"limit": 10, "symbol": "NSE:INFY-EQ", "timeframe": "15m"},
+        )
         assert candles.headers["X-Symbol"] == "NSE:INFY-EQ"
         assert candles.headers["X-Active-Symbol"] == "NSE:INFY-EQ"
         body = candles.json()
@@ -139,7 +142,10 @@ def test_symbol_survives_a_process_restart(db_path):
         assert state["symbol"] == "NSE:INFY-EQ"
         assert state["version"] == version
 
-        candles = second.get("/api/candles", params={"limit": 10})
+        candles = second.get(
+            "/api/candles",
+            params={"limit": 10, "symbol": "NSE:INFY-EQ", "timeframe": "15m"},
+        )
         assert candles.headers["X-Symbol"] == "NSE:INFY-EQ"
         assert max(c["close"] for c in candles.json()) < 5000
 
@@ -170,7 +176,10 @@ def test_change_written_by_another_process_converges(fast_client):
 
     assert state["version"] == external["version"]
 
-    candles = fast_client.get("/api/candles", params={"limit": 10})
+    candles = fast_client.get(
+        "/api/candles",
+        params={"limit": 10, "symbol": "NSE:INFY-EQ", "timeframe": "15m"},
+    )
     assert candles.headers["X-Symbol"] == "NSE:INFY-EQ"
     assert {c["symbol"] for c in candles.json()} == {"NSE:INFY-EQ"}
 

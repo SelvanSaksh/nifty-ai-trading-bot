@@ -60,3 +60,5 @@ Thumbs.db
 
 # Docker (uncomment if you don't want to track these)
 # docker-compose.override.yml
+data/engine.lock
+*.lock

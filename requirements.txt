@@ -9,3 +9,6 @@ numpy==1.26.4
 pandas==2.2.2
 httpx==0.27.0
 requests==2.31.0
+websocket-client==1.6.1
+aws_lambda_powertools==1.25.5
+setuptools<81

@@ -46,7 +46,7 @@ async def validate_token(token: str) -> bool:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                "https://api-t1.fyers.in/api/v3/profile",
+                f"{settings.FYERS_API_URL}/profile",
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
@@ -69,7 +69,7 @@ async def refresh_access_token(refresh_token: str) -> Optional[str]:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api-t1.fyers.in/api/v3/token",
+                f"{settings.FYERS_API_URL}/token",
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:

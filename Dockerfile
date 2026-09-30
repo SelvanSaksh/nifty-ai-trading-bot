@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
+# Fyers official data socket. --no-deps: its pinned aiohttp==3.9.3 would
+# otherwise conflict with the aiohttp pin in requirements.txt; its runtime
+# deps (requests, websocket-client, setuptools/pkg_resources) come from there.
+RUN pip install --no-cache-dir --user --no-deps fyers-apiv3==3.1.18
 
 # Production stage
 FROM python:3.11-slim
@@ -36,6 +40,8 @@ RUN mkdir -p /app/data && chown -R botuser:botuser /app
 USER botuser
 
 # Health check
+# Container-internal probe: the live URL (https://api.trading.quantumvora.com)
+# is served by nginx, which waits for this container to become healthy.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 

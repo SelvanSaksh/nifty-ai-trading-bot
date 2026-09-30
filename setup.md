@@ -16,3 +16,6 @@ pip install -r requirements.txt
 
 # 5. Verify Fyers API installed
 pip show fyers-apiv3
+
+# 6. Fyers live data socket (its pinned aiohttp conflicts with requirements.txt)
+pip install --no-deps fyers-apiv3==3.1.18

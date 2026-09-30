@@ -221,12 +221,18 @@ def _candle_headers(result: dict) -> dict:
 
 
 async def _load_candles(
-    timeframe: str, limit: int, symbol: Optional[str], end_time: Optional[str]
+    timeframe: str, limit: int, symbol: str, end_time: Optional[str]
 ) -> dict:
     bot: NiftyBot = app.state.bot
+    tf = (timeframe or "").strip()
+    value = (symbol or "").strip()
+    if not value:
+        raise HTTPException(status_code=422, detail="symbol is required")
+    if not tf:
+        raise HTTPException(status_code=422, detail="timeframe is required")
     try:
         return await bot.get_candles(
-            timeframe=timeframe, limit=limit, symbol=symbol, end_time=end_time
+            timeframe=tf, limit=limit, symbol=value, end_time=end_time
         )
     except ValueError as exc:  # SymbolValidationError subclasses ValueError
         raise HTTPException(status_code=422, detail=str(exc))
@@ -235,17 +241,18 @@ async def _load_candles(
 @app.get("/api/candles")
 async def get_candles(
     response: Response,
-    timeframe: str = "15m",
+    symbol: str,
+    timeframe: str,
     limit: int = 100,
-    symbol: Optional[str] = None,
     end_time: Optional[str] = None,
 ):
     """
-    Candles for ``symbol``, or for the shared active symbol when omitted.
+    Candles for ``symbol`` on ``timeframe`` — both supplied by the client.
 
-    Every candle carries ``symbol``/``symbol_name``/``timeframe`` and the
-    response repeats them as headers, so a client can detect an instrument
-    change instead of silently rendering mismatched data.
+    Neither the instrument nor the interval is inferred server-side: the FE
+    decides what it renders, and every candle carries
+    ``symbol``/``symbol_name``/``timeframe`` plus response headers so a client
+    can detect a change instead of silently rendering mismatched data.
     """
     result = await _load_candles(timeframe, limit, symbol, end_time)
     for key, value in _candle_headers(result).items():
@@ -255,9 +262,9 @@ async def get_candles(
 
 @app.get("/api/candles/detail")
 async def get_candles_detail(
-    timeframe: str = "15m",
+    symbol: str,
+    timeframe: str,
     limit: int = 100,
-    symbol: Optional[str] = None,
     end_time: Optional[str] = None,
 ):
     """Same data as /api/candles plus the full envelope (coverage, source, error)."""

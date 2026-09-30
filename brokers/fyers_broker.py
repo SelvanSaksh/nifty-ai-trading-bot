@@ -1,9 +1,10 @@
 
 import asyncio
+import os
+import time
 import aiohttp
-import json
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, List
 
 from brokers.base import BaseBroker
 from models.candle import Candle
@@ -11,20 +12,47 @@ from models.trade import Trade
 from config import settings
 
 
+def normalize_tick(msg: Any) -> Optional[Dict[str, Any]]:
+    """Map a Fyers data-socket payload onto the tick shape the engine consumes.
+
+    The official socket also delivers control frames (auth ack, subscribe ack);
+    those carry no price and are dropped here.
+    """
+    if not isinstance(msg, dict):
+        return None
+    symbol = msg.get("symbol")
+    ltp = msg.get("ltp")
+    if not symbol or not ltp:
+        return None
+    return {
+        "symbol": symbol,
+        "ltp": float(ltp),
+        "v": int(msg.get("vol_traded_today") or 0),
+        "open": float(msg.get("open_price") or 0),
+        "high": float(msg.get("high_price") or 0),
+        "low": float(msg.get("low_price") or 0),
+        "prev_close": float(msg.get("prev_close_price") or 0),
+        "ch": msg.get("ch"),
+        "chp": msg.get("chp"),
+        "type": msg.get("type"),
+    }
+
+
 class FyersBroker(BaseBroker):
     """Fyers broker via HTTP REST API."""
-    
-    BASE_URL = "https://api-t1.fyers.in/api/v3"  
-    DATA_URL = "https://api-t1.fyers.in/api/v3"  
-    WS_URL = "wss://socket.fyers.in/v3"
-    
+
+    BASE_URL = settings.FYERS_API_URL
+    DATA_URL = settings.FYERS_API_URL
+
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
-        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self.ws_task: Optional[asyncio.Task] = None
         self.tick_callback: Optional[Callable] = None
         self.is_connected = False
         self._headers = {}
+        self._data_socket = None
+        self._subscribed_symbols: set = set()
+        self._pending_symbols: List[str] = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
     
     def _get_auth_header(self) -> str:
         token = settings.FYERS_ACCESS_TOKEN
@@ -81,54 +109,106 @@ class FyersBroker(BaseBroker):
     
     async def disconnect(self):
         self.is_connected = False
-        if self.ws_task and not self.ws_task.done():
-            self.ws_task.cancel()
+        socket, self._data_socket = self._data_socket, None
+        self._subscribed_symbols.clear()
+        self._pending_symbols = []
+        if socket is not None:
             try:
-                await self.ws_task
-            except asyncio.CancelledError:
-                pass
-        self.ws_task = None
-        if self.ws:
-            await self.ws.close()
-            self.ws = None
+                await asyncio.get_running_loop().run_in_executor(None, socket.close_connection)
+            except Exception as e:
+                print(f"[FYERS] Data socket close failed: {e}")
         if self.session:
             await self.session.close()
             self.session = None
-    
-    async def subscribe_ticks(self, symbols: list[str]):
-        """WebSocket tick subscription (replaces any previous subscription)."""
-        if self.ws_task and not self.ws_task.done():
-            # One subscription at a time — otherwise ticks arrive doubled after
-            # a symbol switch.
-            self.ws_task.cancel()
-            try:
-                await self.ws_task
-            except asyncio.CancelledError:
-                pass
 
-        auth_token = self._get_auth_header()
-        
-        async def ws_listener():
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(
-                    f"{self.WS_URL}?token={auth_token}"
-                ) as ws:
-                    self.ws = ws
-                    
-                    await ws.send_json({
-                        "T": "SUBS",
-                        "symbols": symbols
-                    })
-                    
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            if self.tick_callback:
-                                await self.tick_callback(data)
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            break
-        
-        self.ws_task = asyncio.create_task(ws_listener())
+    def _build_data_socket(self, data_ws, token: str):
+        """Official Fyers data socket wired into the engine's tick callback."""
+        # The SDK decodes the JWT itself, so the "APP-200:" prefix must be stripped.
+        jwt = token.split(":", 1)[1] if ":" in token else token
+        loop = self._loop
+
+        def _on_connect():
+            try:
+                # connect() sleeps 2s before this fires; wait for the handshake so
+                # the subscribe frames are not wiped by the socket's startup queue.
+                for _ in range(50):
+                    if self._data_socket is None or self._data_socket.is_connected():
+                        break
+                    time.sleep(0.1)
+                pending = list(self._pending_symbols)
+                if pending and self._data_socket is not None:
+                    self._data_socket.subscribe(symbols=pending, data_type="SymbolUpdate")
+                    self._subscribed_symbols.update(pending)
+                    self._pending_symbols = []
+                    print(f"[FYERS] Live data socket subscribed to {len(pending)} symbols")
+            except Exception as e:
+                print(f"[FYERS] Data socket subscribe failed: {e}")
+
+        def _on_message(msg):
+            tick = normalize_tick(msg)
+            if tick is None or self.tick_callback is None:
+                return
+            # Runs on the SDK's reader thread — hand the coroutine to the loop.
+            asyncio.run_coroutine_threadsafe(self.tick_callback(tick), loop)
+
+        def _on_error(msg):
+            print(f"[FYERS WS] {msg}")
+
+        def _on_close(msg):
+            print(f"[FYERS WS] closed: {msg}")
+
+        os.makedirs("logs", exist_ok=True)
+        return data_ws.FyersDataSocket(
+            access_token=jwt,
+            log_path="logs",
+            litemode=False,
+            write_to_file=False,
+            reconnect=True,
+            on_connect=_on_connect,
+            on_message=_on_message,
+            on_error=_on_error,
+            on_close=_on_close,
+        )
+
+    async def subscribe_ticks(self, symbols: list[str]):
+        """Live ticks via the official Fyers data socket (HSM feed)."""
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+
+        token = self._get_auth_header()
+        if not token:
+            print("[FYERS] No access token — run `python fyers_auth.py` or GET /api/auth/login")
+            return
+
+        try:
+            from fyers_apiv3.FyersWebsocket import data_ws
+        except ImportError as e:
+            print(f"[FYERS] fyers-apiv3 unavailable ({e}); live ticks are disabled")
+            return
+
+        if self._data_socket is None:
+            self._pending_symbols = list(symbols)
+            self._data_socket = self._build_data_socket(data_ws, token)
+            try:
+                await loop.run_in_executor(None, self._data_socket.connect)
+            except Exception as e:
+                print(f"[FYERS] Data socket connect failed: {e}")
+                self._data_socket = None
+            return
+
+        # Socket already running: only add the symbols added since last time.
+        missing = [s for s in symbols if s not in self._subscribed_symbols]
+        if not missing:
+            return
+        socket = self._data_socket
+        try:
+            await loop.run_in_executor(
+                None, lambda: socket.subscribe(symbols=missing, data_type="SymbolUpdate")
+            )
+        except Exception as e:
+            print(f"[FYERS] Data socket subscribe failed: {e}")
+        else:
+            self._subscribed_symbols.update(missing)
     
     async def get_historical_candles(
         self, 

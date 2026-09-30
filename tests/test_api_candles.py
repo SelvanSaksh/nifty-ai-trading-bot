@@ -5,7 +5,10 @@ from config import settings
 
 
 def test_candles_are_labelled_with_their_symbol(client):
-    resp = client.get("/api/candles", params={"timeframe": "15m", "limit": 30})
+    resp = client.get(
+        "/api/candles",
+        params={"timeframe": "15m", "limit": 30, "symbol": settings.TRADING_SYMBOL},
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -26,7 +29,8 @@ def test_candles_are_labelled_with_their_symbol(client):
 
 def test_candles_for_a_requested_symbol_ignore_the_active_one(client):
     resp = client.get(
-        "/api/candles", params={"symbol": "NSE:INFY-EQ", "limit": 20}
+        "/api/candles",
+        params={"symbol": "NSE:INFY-EQ", "timeframe": "15m", "limit": 20},
     )
 
     assert resp.status_code == 200
@@ -47,9 +51,10 @@ def test_candles_for_a_requested_symbol_ignore_the_active_one(client):
 
 def test_repeated_polls_never_change_the_instrument(client):
     """The reported bug: touching timeframe flipped symbol + data."""
-    first = client.get("/api/candles", params={"timeframe": "5m", "limit": 10})
+    params = {"timeframe": "5m", "limit": 10, "symbol": settings.TRADING_SYMBOL}
+    first = client.get("/api/candles", params=params)
     for _ in range(4):
-        again = client.get("/api/candles", params={"timeframe": "5m", "limit": 10})
+        again = client.get("/api/candles", params=params)
         assert again.headers["X-Symbol"] == first.headers["X-Symbol"]
         assert again.headers["X-Symbol-Version"] == first.headers["X-Symbol-Version"]
         assert again.headers["X-Active-Symbol"] == first.headers["X-Active-Symbol"]
@@ -78,9 +83,12 @@ def test_detail_envelope(client):
 
 
 def test_timeframe_aliases_resolve_to_the_same_bars(client):
-    canonical = client.get("/api/candles", params={"timeframe": "15m", "limit": 5})
-    alias = client.get("/api/candles", params={"timeframe": "15", "limit": 5})
-    hourly = client.get("/api/candles", params={"timeframe": "60", "limit": 5})
+    def with_tf(tf: str) -> dict:
+        return {"timeframe": tf, "limit": 5, "symbol": settings.TRADING_SYMBOL}
+
+    canonical = client.get("/api/candles", params=with_tf("15m"))
+    alias = client.get("/api/candles", params=with_tf("15"))
+    hourly = client.get("/api/candles", params=with_tf("60"))
 
     assert canonical.status_code == alias.status_code == hourly.status_code == 200
     assert canonical.headers["X-Timeframe"] == alias.headers["X-Timeframe"] == "15m"
@@ -91,7 +99,12 @@ def test_end_time_filters_the_window(client):
     end = datetime.now() - timedelta(hours=6)
     resp = client.get(
         "/api/candles",
-        params={"timeframe": "15m", "limit": 40, "end_time": end.isoformat()},
+        params={
+            "timeframe": "15m",
+            "limit": 40,
+            "symbol": settings.TRADING_SYMBOL,
+            "end_time": end.isoformat(),
+        },
     )
 
     assert resp.status_code == 200
@@ -101,12 +114,44 @@ def test_end_time_filters_the_window(client):
 
 
 def test_invalid_requests_return_422(client):
-    assert client.get("/api/candles", params={"timeframe": "7m"}).status_code == 422
-    assert client.get("/api/candles", params={"limit": 0}).status_code == 422
-    assert client.get("/api/candles", params={"limit": 5000}).status_code == 422
-    assert client.get("/api/candles", params={"end_time": "yesterday"}).status_code == 422
-    assert client.get("/api/candles", params={"symbol": "nope"}).status_code == 422
-    assert client.get("/api/candles", params={"timeframe": "abc"}).status_code == 422
+    base = {"symbol": settings.TRADING_SYMBOL, "timeframe": "15m"}
+    assert client.get("/api/candles", params={**base, "timeframe": "7m"}).status_code == 422
+    assert client.get("/api/candles", params={**base, "limit": 0}).status_code == 422
+    assert client.get("/api/candles", params={**base, "limit": 5000}).status_code == 422
+    assert (
+        client.get("/api/candles", params={**base, "end_time": "yesterday"}).status_code
+        == 422
+    )
+    assert client.get("/api/candles", params={**base, "symbol": "nope"}).status_code == 422
+    assert (
+        client.get("/api/candles", params={**base, "timeframe": "abc"}).status_code == 422
+    )
+
+
+def test_symbol_and_timeframe_are_required_and_never_inferred(client):
+    """The FE owns the instrument and the interval: both must be sent."""
+    missing_symbol = client.get(
+        "/api/candles", params={"timeframe": "15m", "limit": 5}
+    )
+    assert missing_symbol.status_code == 422
+
+    missing_timeframe = client.get(
+        "/api/candles", params={"symbol": settings.TRADING_SYMBOL, "limit": 5}
+    )
+    assert missing_timeframe.status_code == 422
+
+    blank_symbol = client.get(
+        "/api/candles", params={"symbol": "   ", "timeframe": "15m", "limit": 5}
+    )
+    assert blank_symbol.status_code == 422
+
+    blank_timeframe = client.get(
+        "/api/candles", params={"symbol": settings.TRADING_SYMBOL, "timeframe": " "}
+    )
+    assert blank_timeframe.status_code == 422
+
+    detail = client.get("/api/candles/detail", params={"limit": 5})
+    assert detail.status_code == 422
 
 
 def test_active_symbol_endpoint_and_candles_agree(client):
@@ -114,7 +159,14 @@ def test_active_symbol_endpoint_and_candles_agree(client):
     values = set()
     for _ in range(6):
         state = client.get("/api/symbols/active").json()
-        candles = client.get("/api/candles", params={"limit": 5})
+        candles = client.get(
+            "/api/candles",
+            params={
+                "limit": 5,
+                "symbol": settings.TRADING_SYMBOL,
+                "timeframe": "15m",
+            },
+        )
         assert candles.headers["X-Active-Symbol"] == state["symbol"]
         assert candles.headers["X-Symbol-Version"] == str(state["version"])
         values.add((state["symbol"], state["version"]))

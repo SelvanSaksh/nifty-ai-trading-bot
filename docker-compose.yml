@@ -13,9 +13,10 @@ services:
       - FYERS_APP_ID=${FYERS_APP_ID}
       - FYERS_SECRET=${FYERS_SECRET}
       - FYERS_ACCESS_TOKEN=${FYERS_ACCESS_TOKEN}
-      - FYERS_REDIRECT_URI=${FYERS_REDIRECT_URI:-http://127.0.0.1:8000/api/auth/callback}
+      - FYERS_REDIRECT_URI=${FYERS_REDIRECT_URI:-https://api.trading.quantumvora.com/api/auth/callback}
       
       # Trading config
+      - BROKER_MODE=${BROKER_MODE:-fyers}
       - PAPER_TRADING=${PAPER_TRADING:-true}
       - CAPITAL=${CAPITAL:-100000}
       - RISK_PER_TRADE=${RISK_PER_TRADE:-0.01}
@@ -48,6 +49,8 @@ services:
 
     # The API is up before the engine is (API-only mode on engine failure),
     # so check /health rather than just the port.
+    # Probe stays on 127.0.0.1 on purpose: the live URL is served by nginx,
+    # which only starts once this healthcheck passes (startup deadlock).
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)"]
       interval: 30s

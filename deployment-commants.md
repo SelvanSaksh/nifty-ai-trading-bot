@@ -13,7 +13,7 @@ docker compose up -d --build
 docker compose logs -f bot
 
 # 5. Health check
-curl http://localhost:8000/health
+curl https://api.trading.quantumvora.com/health
 # -> look for: "engine_leader": true, "bot_running": true, "startup_error": null
 
 # 6. Token refresh (manual trigger)
@@ -34,9 +34,9 @@ docker-compose restart bot
 #    "engine_leader": false in /health.
 
 # 9. Verify which process is trading
-curl http://localhost:8000/health
+curl https://api.trading.quantumvora.com/health
 #    engine_leader=true  -> this container runs the engine
 #    engine_leader=false -> API-only replica (safe, expected when scaled)
 
 # 10. Inspect active-symbol changes (audit trail)
-curl http://localhost:8000/api/symbols/history
+curl https://api.trading.quantumvora.com/api/symbols/history
