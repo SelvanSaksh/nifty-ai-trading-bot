@@ -296,6 +296,23 @@ class TestHistoryFetch:
 
         assert not isinstance(excinfo.value, FyersAuthError)
 
+    async def test_a_fyers_error_body_is_surfaced_not_swallowed(self, monkeypatch):
+        """HTTP 200 + `s:"error"` used to return [] and leave the chart blank."""
+        monkeypatch.setattr(settings, "FYERS_ACCESS_TOKEN", "APP:live")
+        monkeypatch.setattr(fyers_auth, "verify_token", lambda *a, **k: _resolved(True))
+
+        broker = FyersBroker()
+        _stub_session(
+            monkeypatch,
+            broker,
+            FakeResponse(200, '{"s":"error","code":-16,"message":"Could not authenticate the user"}'),
+        )
+
+        with pytest.raises(ConnectionError) as excinfo:
+            await broker.get_historical_candles(symbol="NSE:NIFTY50-INDEX", timeframe="15")
+
+        assert "Could not authenticate the user" in str(excinfo.value)
+
 
 def _stub_session(monkeypatch, broker: FyersBroker, response: FakeResponse):
     async def _ensure():

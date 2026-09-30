@@ -35,6 +35,12 @@ class TestLiveEndpointConfig:
         assert FyersBroker.BASE_URL.startswith("https://")
         assert FyersBroker.BASE_URL == settings.FYERS_API_URL
 
+    def test_candles_use_the_data_host_not_the_trading_host(self):
+        """`api/v3/history` is a 404; candles live under /data."""
+        assert FyersBroker.DATA_URL == settings.FYERS_DATA_URL
+        assert FyersBroker.DATA_URL == "https://api-t1.fyers.in/data"
+        assert FyersBroker.DATA_URL != FyersBroker.BASE_URL
+
     def test_auth_url_uses_configured_app_and_redirect(self, monkeypatch):
         from fyers_auth import get_auth_url
 

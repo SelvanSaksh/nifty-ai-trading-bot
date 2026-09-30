@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # FYERS API v3 production host (FYERS has no sandbox; this is the live
     # endpoint used by the official SDK for trading and market data).
     FYERS_API_URL: str = "https://api-t1.fyers.in/api/v3"
+    # Market-data host. Candles live here, NOT on the trading host — the SDK
+    # declares `DATA_API = "https://api-t1.fyers.in/data"` separately, and
+    # `api/v3/history` answers a bare 404 "page not found".
+    FYERS_DATA_URL: str = "https://api-t1.fyers.in/data"
     # Real market data is the production default. The mock broker is only for
     # local demos and tests; it generates random candles and must never power a
     # chart intended to match an exchange chart.

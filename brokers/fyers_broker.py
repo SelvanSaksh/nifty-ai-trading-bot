@@ -53,7 +53,7 @@ class FyersBroker(BaseBroker):
     """Fyers broker via HTTP REST API."""
 
     BASE_URL = settings.FYERS_API_URL
-    DATA_URL = settings.FYERS_API_URL
+    DATA_URL = settings.FYERS_DATA_URL
 
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
@@ -276,7 +276,7 @@ class FyersBroker(BaseBroker):
         """True when Fyers said these credentials are unusable.
 
         Fyers is inconsistent about *how* it reports a dead token: ``/profile``
-        answers 401 JSON while ``/history`` answers a bare 404 ``text/plain``.
+        answers 401 JSON while some endpoints answer a bare non-JSON body.
         Anything ambiguous is therefore decided by asking ``/profile`` directly.
         """
         from fyers_auth import active_token, mark_token_rejected, verify_token
@@ -349,7 +349,12 @@ class FyersBroker(BaseBroker):
         elif await self._rejects_current_token(status):
             raise FyersAuthError(TOKEN_EXPIRED_MESSAGE)
         else:
-            print(f"[FYERS] History error for {symbol}: {data}")
+            # `s != ok` carries the real reason (e.g. code -16 "Could not
+            # authenticate the user"). Returning [] instead would leave the
+            # chart blank with no message to show.
+            raise ConnectionError(
+                f"Fyers history request failed: {data.get('message') or data.get('code')}"
+            )
 
         if end_time is not None:
             candles = [c for c in candles if c.timestamp <= end_time]
