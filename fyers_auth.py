@@ -5,6 +5,7 @@ Run: python fyers_auth.py
 """
 import os
 import sys
+import time
 import webbrowser
 import asyncio
 import aiohttp
@@ -19,6 +20,12 @@ from config import settings
 
 FYERS_TOKEN_FILE = "data/fyers_token.txt"
 FYERS_API_URL = settings.FYERS_API_URL
+
+# How long a definitive (valid/invalid) /profile answer may be reused. The web
+# client polls /api/auth/status every few seconds, so the probe must be cached.
+PROBE_TTL_SECONDS = 45.0
+# Transient failures (Fyers unreachable, timeout) are retried sooner.
+PROBE_RETRY_SECONDS = 10.0
 
 
 def _belongs_to_current_app(token: str) -> bool:
@@ -72,38 +79,156 @@ def is_token_valid(token: str, expires_at: Optional[datetime]) -> bool:
     return datetime.now() < (expires_at - timedelta(days=1))
 
 
-def auth_status() -> dict:
-    """Return safe token state for the web client; never expose the token."""
-    if settings.FYERS_ACCESS_TOKEN:
+def active_token() -> Tuple[str, Optional[datetime], Optional[str]]:
+    """The token every outbound Fyers call uses.
+
+    A token minted by a completed OAuth login lives in the token file (which
+    survives restarts) and is newer than whatever the process was configured
+    with, so it wins while it is still valid. The environment value is the
+    bootstrap used before the first login — it cannot be rotated without a
+    restart, so it must never shadow a fresh one.
+    """
+    file_token, file_expires = load_token()
+    if file_token and is_token_valid(file_token, file_expires):
+        return file_token, file_expires, "file"
+    env_token = settings.FYERS_ACCESS_TOKEN
+    if env_token:
+        return env_token, None, "environment"
+    return file_token, file_expires, ("file" if file_token else None)
+
+
+# Cached answer of "does Fyers still accept this token?": None = unknown.
+_probe: dict = {"token": None, "valid": None, "checked_at": 0.0}
+
+
+def reset_token_probe() -> None:
+    """Forget the cached verdict (a fresh token was just stored)."""
+    _probe.update(token=None, valid=None, checked_at=0.0)
+
+
+def mark_token_rejected() -> None:
+    """Fyers refused a request with the current token — report it at once."""
+    token, _, _ = active_token()
+    _probe.update(token=token, valid=False, checked_at=time.monotonic())
+
+
+async def verify_token(token: str, force: bool = False) -> Optional[bool]:
+    """Ask Fyers whether it still accepts ``token``.
+
+    Returns True (accepted), False (rejected — expired or revoked) or None when
+    the answer could not be determined (network/5xx), so a Fyers outage never
+    makes the app bounce users into a pointless re-login.
+    """
+    if not token:
+        return False
+
+    now = time.monotonic()
+    if _probe["token"] == token:
+        ttl = PROBE_TTL_SECONDS if _probe["valid"] is not None else PROBE_RETRY_SECONDS
+        if not force and now - _probe["checked_at"] < ttl:
+            return _probe["valid"]
+
+    verdict: Optional[bool] = None
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{FYERS_API_URL}/profile", headers={"Authorization": token}
+            ) as resp:
+                if resp.status == 401:
+                    verdict = False
+                elif resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    verdict = data.get("s") == "ok"
+    except Exception:
+        verdict = None
+
+    _probe.update(token=token, valid=verdict, checked_at=now)
+    return verdict
+
+
+async def auth_status() -> dict:
+    """Return safe token state for the web client; never expose the token.
+
+    The token is *verified* against Fyers, not merely reported as present: a
+    token that Fyers no longer accepts must read as unauthenticated so clients
+    can send the user back to the login flow.
+    """
+    login_available = bool(settings.FYERS_APP_ID and settings.FYERS_SECRET)
+    token, expires_at, source = active_token()
+
+    if not token:
         return {
-            "authenticated": True,
-            "source": "environment",
+            "authenticated": False,
+            "source": source,
             "expires_at": None,
-            "reason": None,
-            "login_available": bool(settings.FYERS_APP_ID and settings.FYERS_SECRET),
+            "reason": "Fyers token missing",
+            "login_available": login_available,
         }
 
-    token, expires_at = load_token()
-    valid = is_token_valid(token, expires_at)
+    verified = await verify_token(token)
+    if verified is False:
+        return {
+            "authenticated": False,
+            "source": source,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "reason": "Fyers access token expired",
+            "login_available": login_available,
+        }
+    if verified is True:
+        return {
+            "authenticated": True,
+            "source": source,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "reason": None,
+            "login_available": login_available,
+        }
+
+    # Fyers could not be reached: trust the recorded expiry when we have one,
+    # otherwise stay optimistic rather than interrupting a live session.
+    valid = is_token_valid(token, expires_at) if expires_at else True
     return {
         "authenticated": valid,
-        "source": "file" if token else None,
+        "source": source,
         "expires_at": expires_at.isoformat() if expires_at else None,
-        "reason": None if valid else ("Fyers token expired" if token else "Fyers token missing"),
-        "login_available": bool(settings.FYERS_APP_ID and settings.FYERS_SECRET),
+        "reason": None if valid else "Fyers token expired",
+        "login_available": login_available,
     }
 
 
-def get_auth_url() -> str:
+def safe_return_url(candidate: Optional[str]) -> Optional[str]:
+    """Post-login destination, restricted to origins we own (no open redirect)."""
+    if not candidate:
+        return None
+    try:
+        parts = urlparse(candidate)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    host = (parts.hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return candidate
+    allowed = {urlparse(settings.FYERS_REDIRECT_URI).hostname or ""}
+    if settings.FRONTEND_URL:
+        allowed.add(urlparse(settings.FRONTEND_URL).hostname or "")
+    return candidate if host in allowed else None
+
+
+def get_auth_url(return_to: Optional[str] = None) -> str:
     """Build the OAuth login URL for both the API redirect and CLI helper."""
     if not settings.FYERS_APP_ID or not settings.FYERS_SECRET:
         raise ValueError("FYERS_APP_ID and FYERS_SECRET must be configured")
+    # Fyers echoes `state` back to the callback, so it carries the page the
+    # browser came from and the user lands back on the terminal after login.
+    target = safe_return_url(return_to)
+    state = quote(target, safe="") if target else "niftybot"
     return (
         f"{FYERS_API_URL}/generate-authcode"
         f"?client_id={settings.FYERS_APP_ID}"
         f"&redirect_uri={quote(settings.FYERS_REDIRECT_URI, safe='')}"
         f"&response_type=code"
-        f"&state=niftybot"
+        f"&state={state}"
     )
 
 

@@ -5,13 +5,21 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
+from urllib.parse import unquote
 from pydantic import BaseModel, Field
 
 from bot import NiftyBot, SymbolConflictError, SymbolValidationError
 from database import init_db, get_active_symbol_state, get_symbol_change_history
 from trading_mcp.server import mcp_app, set_bot_instance
 from config import settings, ensure_data_dir
-from fyers_auth import auth_status, exchange_code_for_token, get_auth_url, save_token
+from fyers_auth import (
+    auth_status,
+    exchange_code_for_token,
+    get_auth_url,
+    reset_token_probe,
+    safe_return_url,
+    save_token,
+)
 from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError
 
@@ -103,14 +111,18 @@ async def health_check():
 @app.get("/api/auth/status")
 async def get_auth_status():
     """Safe Fyers session state for clients that need to reconnect."""
-    return auth_status()
+    return await auth_status()
 
 
 @app.get("/api/auth/login")
-async def begin_fyers_login():
-    """Send the browser to Fyers when a token is missing or expired."""
+async def begin_fyers_login(return_to: Optional[str] = None):
+    """Send the browser to Fyers when a token is missing or expired.
+
+    ``return_to`` is the page the client wants back after login; it travels
+    through OAuth ``state`` and is only honoured for origins we own.
+    """
     try:
-        return RedirectResponse(get_auth_url(), status_code=307)
+        return RedirectResponse(get_auth_url(return_to), status_code=307)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -136,11 +148,26 @@ async def fyers_auth_callback(request: Request):
 
         # Reload settings so the running app picks up the new token
         settings.FYERS_ACCESS_TOKEN = full_token
+        # The cached "is this token valid?" verdict is about the old token, and
+        # the broker's HTTP session/socket still carry the old credentials.
+        reset_token_probe()
+        bot = getattr(app.state, "bot", None)
+        if bot is not None:
+            try:
+                await bot.reauthenticate()
+            except Exception as exc:
+                print(f"[AUTH] Failed to re-arm the broker with the new token: {exc}")
+
+        # `state` travels through Fyers, so it may come back decoded (normal) or
+        # still percent-encoded; accept either, but never a foreign origin.
+        raw_state = params.get("state", "") or ""
+        return_url = safe_return_url(raw_state) or safe_return_url(unquote(raw_state))
+        if return_url:
+            return RedirectResponse(return_url, status_code=302)
 
         return HTMLResponse(
-            f"<h2>Auth Successful</h2>"
-            f"<p>Token saved. You can close this tab.</p>"
-            f"<p>Fyers ID: {params.get('state', 'N/A')}</p>",
+            "<h2>Auth Successful</h2>"
+            "<p>Token saved. You can close this tab and reopen the terminal.</p>",
             status_code=200,
         )
     except Exception as e:

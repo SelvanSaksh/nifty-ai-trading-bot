@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     FYERS_REDIRECT_URI: str = "https://api.trading.quantumvora.com/api/auth/callback"
     FYERS_ACCESS_TOKEN: str = ""
     FYERS_REFRESH_TOKEN: str = ""
+    # Web terminal origin. Used as the post-login landing page when the OAuth
+    # callback cannot recover where the browser came from.
+    FRONTEND_URL: str = ""
     # FYERS API v3 production host (FYERS has no sandbox; this is the live
     # endpoint used by the official SDK for trading and market data).
     FYERS_API_URL: str = "https://api-t1.fyers.in/api/v3"

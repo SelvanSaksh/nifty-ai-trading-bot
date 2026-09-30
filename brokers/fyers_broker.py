@@ -1,5 +1,6 @@
 
 import asyncio
+import json
 import os
 import time
 import aiohttp
@@ -10,6 +11,16 @@ from brokers.base import BaseBroker
 from models.candle import Candle
 from models.trade import Trade
 from config import settings
+
+
+#: Fyers refused the credentials — the client must send the user to /api/auth/login.
+TOKEN_EXPIRED_MESSAGE = (
+    "Fyers access token expired — reconnect Fyers to reload market data"
+)
+
+
+class FyersAuthError(ConnectionError):
+    """Raised when Fyers rejects the access token used for a request."""
 
 
 def normalize_tick(msg: Any) -> Optional[Dict[str, Any]]:
@@ -53,15 +64,16 @@ class FyersBroker(BaseBroker):
         self._subscribed_symbols: set = set()
         self._pending_symbols: List[str] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-    
+        # Authorization value the current session was built with, so a re-login
+        # can be noticed and the session rebuilt.
+        self._auth_token: Optional[str] = None
+
     def _get_auth_header(self) -> str:
-        token = settings.FYERS_ACCESS_TOKEN
-        if not token:
-            # The OAuth callback persists the full token locally. Prefer an
-            # explicitly configured environment value, then recover that token
-            # for normal local restarts without falling back to fake prices.
-            from fyers_auth import load_token
-            token, _ = load_token()
+        # One source of truth for "which token is current", so the credentials
+        # on the wire always match what /api/auth/status reports.
+        from fyers_auth import active_token
+
+        token, _, _ = active_token()
         if not token:
             return ""
         
@@ -71,20 +83,52 @@ class FyersBroker(BaseBroker):
         
         return f"{settings.FYERS_APP_ID}:{token}"
     
-    def _ensure_session(self) -> aiohttp.ClientSession:
-        """Return a live HTTP session, creating one on demand (REST-only calls)."""
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """Return a live HTTP session carrying the token that is active *now*.
+
+        A re-login swaps the credentials while the process keeps running, so the
+        session is rebuilt as soon as it no longer matches the current token —
+        otherwise every request would keep shipping the expired one.
+        """
+        token = self._get_auth_header()
+        if self.session is not None and not self.session.closed and token != self._auth_token:
+            stale, self.session = self.session, None
+            await stale.close()
         if self.session is None or self.session.closed:
+            self._auth_token = token
             self._headers = {
-                "Authorization": self._get_auth_header(),
+                "Authorization": token,
                 "Content-Type": "application/json"
             }
             self.session = aiohttp.ClientSession(headers=self._headers)
         return self.session
+
+    async def reauthenticate(self) -> None:
+        """Forget cached credentials so the next call uses the new token."""
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
+        self.session = None
+        self._auth_token = None
+
+        socket, self._data_socket = self._data_socket, None
+        self._subscribed_symbols.clear()
+        self._pending_symbols = []
+        if socket is not None:
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, socket.close_connection)
+            except Exception as e:
+                print(f"[FYERS] Data socket close failed: {e}")
     
     async def connect(self) -> bool:
         """Validate token by fetching profile."""
         auth_token = self._get_auth_header()
-        
+
+        if not auth_token:
+            self.is_connected = False
+            print("[FYERS] No access token — GET /api/auth/login to authenticate")
+            return False
+
+        self._auth_token = auth_token
         self._headers = {
             "Authorization": auth_token,
             "Content-Type": "application/json"
@@ -95,14 +139,32 @@ class FyersBroker(BaseBroker):
         try:
             # ✅ Correct endpoint: /profile
             async with self.session.get(f"{self.BASE_URL}/profile") as resp:
-                data = await resp.json()
-                print(f"[FYERS] Profile response: {data}")
-                self.is_connected = data.get("s") == "ok"
-                
-                if not self.is_connected:
-                    print(f"[FYERS] Connection failed: {data}")
-                
-                return self.is_connected
+                status = resp.status
+                raw = await resp.text()
+            if status in (401, 403):
+                # The credentials are the problem, not the network — publish it
+                # so /api/auth/status sends clients to the login flow at once.
+                from fyers_auth import mark_token_rejected
+                mark_token_rejected()
+                print("[FYERS] Access token rejected — GET /api/auth/login")
+            # Fyers answers a dead token with 401 and sometimes no body at all,
+            # so never assume the reply is JSON.
+            try:
+                data = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                data = None
+            if not isinstance(data, dict):
+                self.is_connected = False
+                print(f"[FYERS] Profile unavailable (HTTP {status}) — access token expired?")
+                return False
+
+            print(f"[FYERS] Profile response: {data}")
+            self.is_connected = data.get("s") == "ok"
+
+            if not self.is_connected:
+                print(f"[FYERS] Connection failed: {data}")
+
+            return self.is_connected
         except Exception as e:
             print(f"[FYERS] Connection error: {e}")
             return False
@@ -210,6 +272,23 @@ class FyersBroker(BaseBroker):
         else:
             self._subscribed_symbols.update(missing)
     
+    async def _rejects_current_token(self, status: int) -> bool:
+        """True when Fyers said these credentials are unusable.
+
+        Fyers is inconsistent about *how* it reports a dead token: ``/profile``
+        answers 401 JSON while ``/history`` answers a bare 404 ``text/plain``.
+        Anything ambiguous is therefore decided by asking ``/profile`` directly.
+        """
+        from fyers_auth import active_token, mark_token_rejected, verify_token
+
+        token, _, _ = active_token()
+        if not token:
+            return True
+        if status in (401, 403):
+            mark_token_rejected()
+            return True
+        return await verify_token(token, force=True) is False
+
     async def get_historical_candles(
         self, 
         symbol: str = "NSE:NIFTY50-INDEX", 
@@ -220,7 +299,7 @@ class FyersBroker(BaseBroker):
         """Fetch historical candles via REST."""
         from utils.helpers import timeframe_label, TIMEFRAME_MINUTES
 
-        session = self._ensure_session()
+        session = await self._ensure_session()
         # The REST endpoint uses epoch UTC timestamps. Keep every internal
         # candle timestamp in naïve UTC because that is the API's documented
         # JSON contract to the web client.
@@ -239,29 +318,47 @@ class FyersBroker(BaseBroker):
             "range_to": to_date,
             "cont_flag": "1"
         }
-        
+
         async with session.get(f"{self.DATA_URL}/history", params=params) as resp:
-            data = await resp.json()
-            candles = []
-            
-            if data.get("s") == "ok":
-                for c in data.get("candles", []):
-                    candles.append(Candle(
-                        timestamp=datetime.utcfromtimestamp(c[0]),
-                        open=c[1], high=c[2], low=c[3],
-                        close=c[4], volume=c[5],
-                        timeframe=label,
-                        symbol=symbol,
-                    ))
-            
-            if end_time is not None:
-                candles = [c for c in candles if c.timestamp <= end_time]
+            status = resp.status
+            # Never `resp.json()` here: a rejected token makes Fyers answer
+            # `text/plain`, and aiohttp's ContentTypeError then swallowed the
+            # real reason and left clients with an empty chart.
+            raw = await resp.text()
 
-            candles.sort(key=lambda c: c.timestamp)
-            if limit and len(candles) > limit:
-                candles = candles[-limit:]
+        try:
+            data = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            data = None
 
-            return candles
+        if not isinstance(data, dict):
+            if await self._rejects_current_token(status):
+                raise FyersAuthError(TOKEN_EXPIRED_MESSAGE)
+            raise ConnectionError(f"Fyers history request failed (HTTP {status})")
+
+        candles = []
+        if data.get("s") == "ok":
+            for c in data.get("candles", []):
+                candles.append(Candle(
+                    timestamp=datetime.utcfromtimestamp(c[0]),
+                    open=c[1], high=c[2], low=c[3],
+                    close=c[4], volume=c[5],
+                    timeframe=label,
+                    symbol=symbol,
+                ))
+        elif await self._rejects_current_token(status):
+            raise FyersAuthError(TOKEN_EXPIRED_MESSAGE)
+        else:
+            print(f"[FYERS] History error for {symbol}: {data}")
+
+        if end_time is not None:
+            candles = [c for c in candles if c.timestamp <= end_time]
+
+        candles.sort(key=lambda c: c.timestamp)
+        if limit and len(candles) > limit:
+            candles = candles[-limit:]
+
+        return candles
     
     async def place_order(self, trade: Trade) -> Dict[str, Any]:
         """Place order via REST API."""
@@ -283,27 +380,32 @@ class FyersBroker(BaseBroker):
             "takeProfit": trade.target_1
         }
         
-        async with self.session.post(f"{self.BASE_URL}/orders", json=order_data) as resp:
+        session = await self._ensure_session()
+        async with session.post(f"{self.BASE_URL}/orders", json=order_data) as resp:
             return await resp.json()
     
     async def modify_order(self, order_id: str, **kwargs) -> bool:
         data = {"id": order_id, **kwargs}
-        async with self.session.patch(f"{self.BASE_URL}/orders", json=data) as resp:
+        session = await self._ensure_session()
+        async with session.patch(f"{self.BASE_URL}/orders", json=data) as resp:
             result = await resp.json()
             return result.get("s") == "ok"
     
     async def cancel_order(self, order_id: str) -> bool:
-        async with self.session.delete(f"{self.BASE_URL}/orders", params={"id": order_id}) as resp:
+        session = await self._ensure_session()
+        async with session.delete(f"{self.BASE_URL}/orders", params={"id": order_id}) as resp:
             result = await resp.json()
             return result.get("s") == "ok"
     
     async def get_positions(self) -> list[Dict[str, Any]]:
-        async with self.session.get(f"{self.BASE_URL}/positions") as resp:
+        session = await self._ensure_session()
+        async with session.get(f"{self.BASE_URL}/positions") as resp:
             data = await resp.json()
             return data.get("netPositions", [])
     
     async def get_funds(self) -> Dict[str, float]:
-        async with self.session.get(f"{self.BASE_URL}/funds") as resp:
+        session = await self._ensure_session()
+        async with session.get(f"{self.BASE_URL}/funds") as resp:
             data = await resp.json()
             funds = data.get("fund_limit", [])
             return {

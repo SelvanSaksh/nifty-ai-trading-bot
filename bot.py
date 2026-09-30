@@ -186,6 +186,23 @@ class NiftyBot:
             await self._emergency_exit("Bot stopped")
         await self.notifier.send(f"🛑 {self.symbol_name} AI Bot stopped")
 
+    async def reauthenticate(self):
+        """Adopt a freshly stored Fyers token without restarting the engine.
+
+        Called by the OAuth callback: the HTTP session and the data socket both
+        cache the old credentials, so a new token only takes effect once they
+        are rebuilt.
+        """
+        refresher = getattr(self.broker, "reauthenticate", None)
+        if refresher is None:
+            return
+        await refresher()
+        if self.is_running:
+            self.broker.tick_callback = self._on_tick
+            if self._all_symbols:
+                await self.broker.subscribe_ticks(self._all_symbols)
+                print(f"[BOT] Resubscribed to {len(self._all_symbols)} symbols after re-login")
+
     # ── Active symbol ─────────────────────────────────────────────
 
     @staticmethod
