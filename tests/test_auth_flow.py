@@ -335,3 +335,86 @@ class TestLoginEndpoints:
 
         assert response.status_code == 307
         assert "state=niftybot" in response.headers["location"]
+
+
+class TestLoginCallbackOrigin:
+    """A browser must never be sent to Fyers with someone else's 127.0.0.1."""
+
+    @pytest.fixture(autouse=True)
+    def _credentials(self, monkeypatch):
+        monkeypatch.setattr(settings, "FYERS_APP_ID", "77M2C2QWOQ-200")
+        monkeypatch.setattr(settings, "FYERS_SECRET", "secret")
+
+    @staticmethod
+    def _redirect_uri(location: str) -> str:
+        from urllib.parse import parse_qs, urlparse
+
+        return parse_qs(urlparse(location).query)["redirect_uri"][0]
+
+    def test_a_public_request_never_receives_a_loopback_callback(self, client, monkeypatch):
+        monkeypatch.setattr(
+            settings, "FYERS_REDIRECT_URI", "http://127.0.0.1:8000/api/auth/callback"
+        )
+
+        response = client.get(
+            "https://api.trading.quantumvora.com/api/auth/login", follow_redirects=False
+        )
+
+        assert response.status_code == 307
+        assert self._redirect_uri(response.headers["location"]) == (
+            "https://api.trading.quantumvora.com/api/auth/callback"
+        )
+
+    def test_the_forwarded_scheme_survives_tls_termination(self, client, monkeypatch):
+        monkeypatch.setattr(
+            settings, "FYERS_REDIRECT_URI", "http://127.0.0.1:8000/api/auth/callback"
+        )
+
+        response = client.get(
+            "http://api.trading.quantumvora.com/api/auth/login",
+            headers={"X-Forwarded-Proto": "https"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 307
+        assert self._redirect_uri(response.headers["location"]).startswith("https://")
+
+    def test_a_local_api_keeps_the_local_callback(self, client, monkeypatch):
+        monkeypatch.setattr(
+            settings, "FYERS_REDIRECT_URI", "http://127.0.0.1:8000/api/auth/callback"
+        )
+
+        response = client.get(
+            "http://127.0.0.1:8000/api/auth/login", follow_redirects=False
+        )
+
+        assert response.status_code == 307
+        assert self._redirect_uri(response.headers["location"]) == (
+            "http://127.0.0.1:8000/api/auth/callback"
+        )
+
+    def test_a_configured_public_callback_is_left_alone(self, client, monkeypatch):
+        monkeypatch.setattr(
+            settings, "FYERS_REDIRECT_URI", "https://api.trading.quantumvora.com/api/auth/callback"
+        )
+
+        response = client.get(
+            "http://api.trading.quantumvora.com/api/auth/login", follow_redirects=False
+        )
+
+        assert response.status_code == 307
+        assert self._redirect_uri(response.headers["location"]) == (
+            "https://api.trading.quantumvora.com/api/auth/callback"
+        )
+
+    @pytest.mark.parametrize(
+        ("configured", "origin", "expected"),
+        [
+            ("http://127.0.0.1:8000/api/auth/callback", "https://a.example", "https://a.example/api/auth/callback"),
+            ("http://localhost:8000/api/auth/callback", "http://127.0.0.1:8000", "http://localhost:8000/api/auth/callback"),
+            ("https://api.trading.quantumvora.com/api/auth/callback", "http://elsewhere.example", "https://api.trading.quantumvora.com/api/auth/callback"),
+            ("http://127.0.0.1:8000/api/auth/callback", "", "http://127.0.0.1:8000/api/auth/callback"),
+        ],
+    )
+    def test_resolver_rules(self, configured, origin, expected):
+        assert fyers_auth.effective_redirect_uri(origin, configured) == expected

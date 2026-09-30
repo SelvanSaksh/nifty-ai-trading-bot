@@ -27,6 +27,9 @@ PROBE_TTL_SECONDS = 45.0
 # Transient failures (Fyers unreachable, timeout) are retried sooner.
 PROBE_RETRY_SECONDS = 10.0
 
+# Hostnames a callback may only ever serve when the API itself runs there.
+LOOPBACK_HOSTS = frozenset({"", "localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
 
 def _belongs_to_current_app(token: str) -> bool:
     """Reject tokens minted for a different Fyers app (stale credentials)."""
@@ -215,7 +218,29 @@ def safe_return_url(candidate: Optional[str]) -> Optional[str]:
     return candidate if host in allowed else None
 
 
-def get_auth_url(return_to: Optional[str] = None) -> str:
+def effective_redirect_uri(incoming_origin: str, configured: Optional[str] = None) -> str:
+    """The callback Fyers must return the browser to for this request.
+
+    ``FYERS_REDIRECT_URI`` defaults to the deployed API, but a local override
+    (``http://127.0.0.1:8000/api/auth/callback``) is only reachable from the
+    machine running the API. Handing that value to Fyers from the public
+    deployment would bounce every user's browser to their own ``127.0.0.1``,
+    so when the configured callback is loopback and the request did not arrive
+    over loopback, the callback is rebuilt from the origin the client used.
+    """
+    if configured is None:
+        configured = settings.FYERS_REDIRECT_URI
+    wanted = urlparse(configured)
+    if (wanted.hostname or "").lower() not in LOOPBACK_HOSTS:
+        return configured
+    incoming = urlparse(incoming_origin)
+    if (incoming.hostname or "").lower() in LOOPBACK_HOSTS:
+        return configured
+    path = wanted.path or "/api/auth/callback"
+    return f"{incoming.scheme}://{incoming.netloc}{path}"
+
+
+def get_auth_url(return_to: Optional[str] = None, redirect_uri: Optional[str] = None) -> str:
     """Build the OAuth login URL for both the API redirect and CLI helper."""
     if not settings.FYERS_APP_ID or not settings.FYERS_SECRET:
         raise ValueError("FYERS_APP_ID and FYERS_SECRET must be configured")
@@ -223,10 +248,11 @@ def get_auth_url(return_to: Optional[str] = None) -> str:
     # browser came from and the user lands back on the terminal after login.
     target = safe_return_url(return_to)
     state = quote(target, safe="") if target else "niftybot"
+    callback = redirect_uri if redirect_uri is not None else settings.FYERS_REDIRECT_URI
     return (
         f"{FYERS_API_URL}/generate-authcode"
         f"?client_id={settings.FYERS_APP_ID}"
-        f"&redirect_uri={quote(settings.FYERS_REDIRECT_URI, safe='')}"
+        f"&redirect_uri={quote(callback, safe='')}"
         f"&response_type=code"
         f"&state={state}"
     )

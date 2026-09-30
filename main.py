@@ -14,6 +14,7 @@ from trading_mcp.server import mcp_app, set_bot_instance
 from config import settings, ensure_data_dir
 from fyers_auth import (
     auth_status,
+    effective_redirect_uri,
     exchange_code_for_token,
     get_auth_url,
     reset_token_probe,
@@ -114,15 +115,30 @@ async def get_auth_status():
     return await auth_status()
 
 
+def request_origin(request: Request) -> str:
+    """Origin as the *browser* reached it.
+
+    nginx terminates TLS and passes ``X-Forwarded-Proto``/``Host``, but uvicorn
+    is not run with ``--proxy-headers``, so ``request.url`` alone would report
+    ``http://`` and lose the public name entirely.
+    """
+    scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    host = request.headers.get("host", "").split(",")[0].strip()
+    return f"{scheme or request.url.scheme}://{host or request.url.netloc}"
+
+
 @app.get("/api/auth/login")
-async def begin_fyers_login(return_to: Optional[str] = None):
+async def begin_fyers_login(request: Request, return_to: Optional[str] = None):
     """Send the browser to Fyers when a token is missing or expired.
 
     ``return_to`` is the page the client wants back after login; it travels
     through OAuth ``state`` and is only honoured for origins we own.
     """
+    redirect_uri = effective_redirect_uri(request_origin(request))
+    if redirect_uri != settings.FYERS_REDIRECT_URI:
+        print(f"[AUTH] loopback FYERS_REDIRECT_URI overridden -> {redirect_uri}")
     try:
-        return RedirectResponse(get_auth_url(return_to), status_code=307)
+        return RedirectResponse(get_auth_url(return_to, redirect_uri), status_code=307)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
