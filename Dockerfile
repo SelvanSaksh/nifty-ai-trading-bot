@@ -33,8 +33,10 @@ ENV PATH=/home/botuser/.local/bin:$PATH
 # Copy application code
 COPY . .
 
-# Create data directory and set permissions
-RUN mkdir -p /app/data && chown -R botuser:botuser /app
+# Create data and log directories owned by the non-root user. /app/logs must
+# exist here: an empty named volume mounted on it inherits this ownership, so
+# the Fyers data socket can write logs/fyersDataSocket.log.
+RUN mkdir -p /app/data /app/logs && chown -R botuser:botuser /app
 
 # Switch to non-root user
 USER botuser

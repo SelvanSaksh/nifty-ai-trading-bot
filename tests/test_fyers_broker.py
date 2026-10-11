@@ -94,3 +94,69 @@ class TestTokenBelongsToApp:
 
         assert token.startswith("77M2C2QWOQ-200:")
         assert expires_at is not None
+
+
+class TestDataSocketLogDir:
+    """The SDK opens logs/fyersDataSocket.log while building the socket; an
+    unwritable log directory used to crash the engine (startup_error
+    "[Errno 13] Permission denied: '/app/logs/fyersDataSocket.log'")."""
+
+    def test_writable_directory_is_used(self, tmp_path):
+        from brokers.fyers_broker import DATA_SOCKET_LOG_FILE, writable_log_dir
+
+        target = tmp_path / "logs"
+        assert writable_log_dir(str(target)) == str(target)
+        assert (target / DATA_SOCKET_LOG_FILE).exists()
+
+    def test_unwritable_directory_falls_back_to_temp(self, tmp_path, monkeypatch):
+        import tempfile
+
+        from brokers.fyers_broker import writable_log_dir
+
+        # A plain file where the directory should be: makedirs/open fail with
+        # an OSError on every platform, like a root-owned bind mount in Docker.
+        blocked = tmp_path / "logs"
+        blocked.write_text("not a directory")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+        chosen = writable_log_dir(str(blocked))
+        assert chosen != str(blocked)
+        assert chosen.startswith(str(tmp_path / "tmp"))
+
+    def test_env_override(self, tmp_path, monkeypatch):
+        from brokers.fyers_broker import writable_log_dir
+
+        monkeypatch.setenv("FYERS_LOG_DIR", str(tmp_path / "custom"))
+        assert writable_log_dir() == str(tmp_path / "custom")
+
+    def test_socket_is_built_with_a_writable_log_path(self, tmp_path, monkeypatch):
+        import os
+
+        captured = {}
+
+        class FakeDataWs:
+            @staticmethod
+            def FyersDataSocket(**kwargs):
+                captured.update(kwargs)
+                # What the real SDK does on construction.
+                open(os.path.join(kwargs["log_path"], "fyersDataSocket.log"), "a").close()
+                return object()
+
+        # Reproduce production: the default ./logs exists but is unusable
+        # (there it was a root-owned bind mount; here a plain file).
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("FYERS_LOG_DIR", raising=False)
+        blocked = tmp_path / "logs"
+        blocked.write_text("not a directory")
+        import tempfile
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+
+        broker = FyersBroker.__new__(FyersBroker)
+        broker._loop = None
+        broker._data_socket = None
+        broker._pending_symbols = []
+        broker._subscribed_symbols = set()
+        broker.tick_callback = None
+        socket = broker._build_data_socket(FakeDataWs, "APP-200:header.payload.sig")
+        assert socket is not None
+        assert captured["log_path"] not in ("logs", str(blocked))
+        assert captured["access_token"] == "header.payload.sig"

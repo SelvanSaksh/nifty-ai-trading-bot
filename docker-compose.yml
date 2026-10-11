@@ -64,7 +64,12 @@ services:
     volumes:
       # Persist database and tokens across restarts
       - bot_data:/app/data
-      - ./logs:/app/logs
+      # Named volume, not a ./logs bind mount: Docker creates a missing bind
+      # directory as root, and the non-root bot user then cannot write
+      # logs/fyersDataSocket.log - which killed the live data socket
+      # ("[Errno 13] Permission denied" in /health -> startup_error).
+      # Read them with: docker compose exec bot ls -l /app/logs
+      - bot_logs:/app/logs
     
     networks:
       - bot_network
@@ -112,6 +117,8 @@ services:
 
 volumes:
   bot_data:
+    driver: local
+  bot_logs:
     driver: local
   redis_data:
     driver: local

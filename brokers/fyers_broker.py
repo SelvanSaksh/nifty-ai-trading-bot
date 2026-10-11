@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import tempfile
 import time
 import aiohttp
 from datetime import datetime, timedelta
@@ -21,6 +22,40 @@ TOKEN_EXPIRED_MESSAGE = (
 
 class FyersAuthError(ConnectionError):
     """Raised when Fyers rejects the access token used for a request."""
+
+
+#: File the Fyers SDK opens inside ``log_path`` as soon as the data socket is built.
+DATA_SOCKET_LOG_FILE = "fyersDataSocket.log"
+
+
+def writable_log_dir(preferred: Optional[str] = None) -> str:
+    """Directory the Fyers data socket can write its log file to.
+
+    The SDK opens ``<log_path>/fyersDataSocket.log`` while the socket is being
+    constructed (even with ``write_to_file=False``). In Docker, ``/app/logs``
+    used to be a root-owned bind mount that the non-root ``botuser`` cannot
+    write, so building the socket raised ``PermissionError`` and the whole
+    engine fell back to API-only mode: no live ticks, no live candles, no
+    quotes. A log file must never stop trading, so an unwritable directory
+    falls back to a private temp directory instead.
+    """
+    candidates = [
+        preferred or os.environ.get("FYERS_LOG_DIR") or "logs",
+        os.path.join(tempfile.gettempdir(), "fyers-logs"),
+    ]
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            # Open the real log file (not just the directory): a root-owned
+            # file left by an earlier run is just as fatal as a root-owned dir.
+            with open(os.path.join(path, DATA_SOCKET_LOG_FILE), "a"):
+                pass
+            if path != candidates[0]:
+                print(f"[FYERS] Data socket logs go to {path!r} instead")
+            return path
+        except OSError as e:
+            print(f"[FYERS] Log directory {path!r} is not writable ({e})")
+    return tempfile.gettempdir()
 
 
 def normalize_tick(msg: Any) -> Optional[Dict[str, Any]]:
@@ -219,10 +254,9 @@ class FyersBroker(BaseBroker):
         def _on_close(msg):
             print(f"[FYERS WS] closed: {msg}")
 
-        os.makedirs("logs", exist_ok=True)
         return data_ws.FyersDataSocket(
             access_token=jwt,
-            log_path="logs",
+            log_path=writable_log_dir(),
             litemode=False,
             write_to_file=False,
             reconnect=True,
@@ -250,11 +284,13 @@ class FyersBroker(BaseBroker):
 
         if self._data_socket is None:
             self._pending_symbols = list(symbols)
-            self._data_socket = self._build_data_socket(data_ws, token)
             try:
+                # Building the socket can fail too (it opens its log file);
+                # that must cost live ticks, not the whole engine.
+                self._data_socket = self._build_data_socket(data_ws, token)
                 await loop.run_in_executor(None, self._data_socket.connect)
             except Exception as e:
-                print(f"[FYERS] Data socket connect failed: {e}")
+                print(f"[FYERS] Data socket unavailable, live ticks disabled: {e}")
                 self._data_socket = None
             return
 

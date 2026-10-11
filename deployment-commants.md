@@ -40,3 +40,18 @@ curl https://api.trading.quantumvora.com/health
 
 # 10. Inspect active-symbol changes (audit trail)
 curl https://api.trading.quantumvora.com/api/symbols/history
+
+# 11. Live data socket / logs (fix for "Permission denied: /app/logs/fyersDataSocket.log")
+#    /app/logs is now a named volume (bot_logs) owned by the non-root bot user.
+#    It used to be a ./logs bind mount; Docker created that folder as root, the
+#    bot could not write the Fyers socket log, and the engine started in
+#    API-only mode (no live ticks, frozen candles, empty watchlist quotes).
+#    Redeploy after pulling this change:
+git pull
+docker compose up -d --build bot
+curl https://api.trading.quantumvora.com/health
+#    -> "startup_error": null, "engine_leader": true
+docker compose logs bot | grep -i "data socket"
+#    -> "[FYERS] Live data socket subscribed to N symbols" (during market hours)
+#    Socket logs: docker compose exec bot ls -l /app/logs
+#    The old host ./logs folder is no longer used and can be deleted.
