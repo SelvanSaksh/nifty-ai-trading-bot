@@ -125,8 +125,9 @@ def test_symbol_survives_a_process_restart(db_path):
     from fastapi.testclient import TestClient
 
     import main
+    from tests.conftest import TEST_ADMIN_KEY
 
-    with TestClient(main.app) as first:
+    with TestClient(main.app, headers={"X-Admin-Key": TEST_ADMIN_KEY}) as first:
         resp = first.post(
             "/api/symbols/active",
             json={"symbol": "NSE:INFY-EQ", "changed_by": "pytest"},

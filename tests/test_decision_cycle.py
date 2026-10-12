@@ -32,7 +32,7 @@ async def test_candle_close_records_the_symbol(db_path):
 
     candle = bot.analyzer.candles_15m[-1]
     # Same order as production: indicators are computed when the bar closes.
-    bot.analyzer._finalize_candle(candle)
+    bot.analyzer._finalize_candle(candle, bot.analyzer.candles_15m)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         await bot._on_candle_close(candle)

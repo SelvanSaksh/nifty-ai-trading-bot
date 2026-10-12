@@ -2,13 +2,17 @@
 MCP Server for Trading Bot.
 Exposes 10 tools + in-app Claude assistant integration.
 """
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 
 from trading_mcp.tools import MCPTools
+from utils.auth import verify_admin_key
 
 mcp_app = FastAPI(title="Trading MCP Server")
 
 tools = MCPTools()
+
+# Tool names marked read_only: False in list_tools() below.
+STATE_CHANGING_TOOLS = {"start_bot", "stop_bot"}
 
 
 @mcp_app.on_event("startup")
@@ -101,8 +105,10 @@ async def list_tools():
 
 
 @mcp_app.post("/invoke/{tool_name}")
-async def invoke_tool(tool_name: str, params: dict = None):
-    """Invoke a specific MCP tool."""
+async def invoke_tool(tool_name: str, params: dict = None, x_admin_key: str = Header(default="")):
+    """Invoke a specific MCP tool. State-changing tools require X-Admin-Key."""
+    if tool_name in STATE_CHANGING_TOOLS:
+        verify_admin_key(x_admin_key)
     return await tools.invoke(tool_name, params)
 
 

@@ -14,8 +14,11 @@ from config import settings
 class FyersBroker(BaseBroker):
     """Fyers broker via HTTP REST API."""
     
-    BASE_URL = "https://api-t1.fyers.in/api/v3"  
-    DATA_URL = "https://api-t1.fyers.in/api/v3"  
+    BASE_URL = "https://api-t1.fyers.in/api/v3"
+    # Historical candles live under a separate /data/ prefix, not /api/v3/ —
+    # hitting /api/v3/history 404s (plain-text body, which is what caused
+    # aiohttp's resp.json() to blow up with a "wrong mimetype" error).
+    DATA_URL = "https://api-t1.fyers.in/data"
     WS_URL = "wss://socket.fyers.in/v3"
     
     def __init__(self):
@@ -162,18 +165,38 @@ class FyersBroker(BaseBroker):
         
         async with session.get(f"{self.DATA_URL}/history", params=params) as resp:
             data = await resp.json()
+
+            status = data.get("s")
+            if status not in ("ok", "no_data"):
+                # Fyers returns errors as {"s": "error", "message": ...} rather
+                # than a non-2xx HTTP status — swallowing this silently made
+                # every failure (expired token, bad symbol, rate limit) look
+                # identical to "genuinely no candles", with no way to tell
+                # them apart from the API response. "no_data" is a legitimate
+                # empty result (e.g. a freshly-listed instrument), not an error.
+                raise RuntimeError(
+                    f"Fyers history request failed for {symbol} ({timeframe}): "
+                    f"{data.get('message', data)}"
+                )
+
+            # Fyers can echo back the same bar twice for a single request
+            # (observed with cont_flag=1 over wider ranges) — dedupe by
+            # epoch so a repeated bar never renders as a doubled-up candle.
+            seen_epochs = set()
             candles = []
-            
-            if data.get("s") == "ok":
-                for c in data.get("candles", []):
-                    candles.append(Candle(
-                        timestamp=datetime.utcfromtimestamp(c[0]),
-                        open=c[1], high=c[2], low=c[3],
-                        close=c[4], volume=c[5],
-                        timeframe=label,
-                        symbol=symbol,
-                    ))
-            
+            for c in data.get("candles", []):
+                epoch = c[0]
+                if epoch in seen_epochs:
+                    continue
+                seen_epochs.add(epoch)
+                candles.append(Candle(
+                    timestamp=datetime.utcfromtimestamp(epoch),
+                    open=c[1], high=c[2], low=c[3],
+                    close=c[4], volume=c[5],
+                    timeframe=label,
+                    symbol=symbol,
+                ))
+
             if end_time is not None:
                 candles = [c for c in candles if c.timestamp <= end_time]
 

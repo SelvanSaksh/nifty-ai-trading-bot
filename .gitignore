@@ -24,6 +24,12 @@ dist/
 .env.*
 !.env.example
 
+# Runtime data: the Fyers access token (a live broker credential) and the
+# engine's cross-process lock file both live here and must never be
+# committed — see fyers_auth.py:save_token / utils/engine_lock.py.
+data/*
+!data/.gitkeep
+
 # Testing
 .pytest_cache/
 .coverage
