@@ -1,4 +1,18 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
+import sys
+
+# Windows' console defaults to a legacy codepage (cp1252 / "charmap") that
+# cannot encode the emoji used throughout print() calls and notifier
+# messages (bot start/stop, token save, trade alerts, etc.). An unhandled
+# UnicodeEncodeError there previously got mistaken for the *actual*
+# operation failing — e.g. the Fyers auth callback reporting "Token
+# Exchange Failed" when the token had already been exchanged and saved;
+# only the trailing print() crashed. Force UTF-8 so these prints never
+# raise regardless of the host console's codepage.
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -23,6 +37,7 @@ from fyers_auth import (
 )
 from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError
+from utils.auth import require_admin_key
 
 
 # Headers that let a client verify *which* instrument it is looking at.
@@ -41,6 +56,13 @@ async def lifespan(app: FastAPI):
     app.state.bot = NiftyBot()
     app.state.startup_error = None
     set_bot_instance(app.state.bot)  # Link to MCP server
+
+    if settings.ADMIN_SECRET_KEY == "change-me-in-production":
+        print(
+            "[BOOT] WARNING: ADMIN_SECRET_KEY is still the default value. "
+            "Bot start/stop/restart and symbol-switch endpoints are guarded by "
+            "this key — set a real secret in .env before deploying."
+        )
 
     try:
         await app.state.bot.start()
@@ -361,7 +383,7 @@ async def get_active_symbol():
     return await bot.get_symbol()
 
 
-@app.post("/api/symbols/active")
+@app.post("/api/symbols/active", dependencies=[Depends(require_admin_key)])
 async def set_active_symbol(request: SetActiveSymbolRequest):
     """Set the active trading symbol (persisted, versioned, audited)."""
     bot: NiftyBot = app.state.bot
@@ -393,7 +415,7 @@ async def get_watchlist():
 
 # ── Bot Control ─────────────────────────────────────────────────
 
-@app.post("/api/bot/start")
+@app.post("/api/bot/start", dependencies=[Depends(require_admin_key)])
 async def start_bot():
     bot: NiftyBot = app.state.bot
     if bot.is_running:
@@ -409,7 +431,7 @@ async def start_bot():
     return {"message": "Bot started", "uptime": bot.uptime, "symbol": bot.symbol}
 
 
-@app.post("/api/bot/stop")
+@app.post("/api/bot/stop", dependencies=[Depends(require_admin_key)])
 async def stop_bot():
     bot: NiftyBot = app.state.bot
     if not bot.is_running:
@@ -419,7 +441,7 @@ async def stop_bot():
     return {"message": "Bot stopped", "today_pnl": round(bot.today_pnl, 2)}
 
 
-@app.post("/api/bot/restart")
+@app.post("/api/bot/restart", dependencies=[Depends(require_admin_key)])
 async def restart_bot():
     bot: NiftyBot = app.state.bot
     if bot.is_running:

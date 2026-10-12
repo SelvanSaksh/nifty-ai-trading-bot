@@ -1,5 +1,5 @@
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime
 
 from models.candle import Candle
 from models.enums import Direction
@@ -18,69 +18,86 @@ class Analyzer:
         self.candles_1h: List[Candle] = []
     
     def add_tick(self, price: float, volume: int, timestamp: datetime) -> Optional[Candle]:
-        """Process incoming tick, build candles for all timeframes."""
+        """
+        Process incoming tick, build candles for all timeframes.
+
+        A bar's own boundary can never be observed as "closed" from a tick
+        that falls inside it — a tick timestamp is always floored to the bar
+        that contains it, so ``timestamp < bar_start + timeframe`` by
+        construction. The close is only observable one tick later, on the
+        first tick that belongs to the *next* bar: that is when
+        ``_get_or_create_candle_for_tf`` opens a new bar and hands back the
+        just-sealed previous one.
+
+        Only a closed **15m** candle is returned: 15m is the primary decision
+        timeframe (``config.PRIMARY_TIMEFRAME``) that the decision engine's
+        ATR-based stop/target sizing is calibrated for, 1h is the higher-
+        timeframe veto filter, and 5m exists purely so the UI can chart a
+        5-minute view. 5m/1h candles are still finalized (indicators computed
+        and available for their own chart/history) — they just never trigger
+        a trading decision cycle themselves.
+        """
         closed_candle = None
 
         # Build 5m candle
-        candle_5m = self._get_or_create_candle_for_tf(timestamp, price, volume, 5, self.candles_5m)
+        candle_5m, sealed_5m = self._get_or_create_candle_for_tf(timestamp, price, volume, 5, self.candles_5m)
         candle_5m.high = max(candle_5m.high, price)
         candle_5m.low = min(candle_5m.low, price)
         candle_5m.close = price
         candle_5m.volume += volume
-        if self._is_candle_closed_at(candle_5m, timestamp, 5):
-            self._finalize_candle(candle_5m)
-            closed_candle = candle_5m
+        if sealed_5m is not None:
+            self._finalize_candle(sealed_5m, self.candles_5m[:-1])
 
         # Build 15m candle
-        candle_15m = self._get_or_create_candle_for_tf(timestamp, price, volume, 15, self.candles_15m)
+        candle_15m, sealed_15m = self._get_or_create_candle_for_tf(timestamp, price, volume, 15, self.candles_15m)
         candle_15m.high = max(candle_15m.high, price)
         candle_15m.low = min(candle_15m.low, price)
         candle_15m.close = price
         candle_15m.volume += volume
-        if self._is_candle_closed_at(candle_15m, timestamp, 15):
-            self._finalize_candle(candle_15m)
-            closed_candle = candle_15m
+        if sealed_15m is not None:
+            self._finalize_candle(sealed_15m, self.candles_15m[:-1])
+            closed_candle = sealed_15m
 
         # Build 1h candle
-        candle_1h = self._get_or_create_candle_for_tf(timestamp, price, volume, 60, self.candles_1h)
+        candle_1h, sealed_1h = self._get_or_create_candle_for_tf(timestamp, price, volume, 60, self.candles_1h)
         candle_1h.high = max(candle_1h.high, price)
         candle_1h.low = min(candle_1h.low, price)
         candle_1h.close = price
         candle_1h.volume += volume
-        if self._is_candle_closed_at(candle_1h, timestamp, 60):
-            self._finalize_candle(candle_1h)
-            closed_candle = candle_1h
+        if sealed_1h is not None:
+            self._finalize_candle(sealed_1h, self.candles_1h[:-1])
 
         return closed_candle
 
-    def _get_or_create_candle_for_tf(self, ts: datetime, price: float, volume: int, minutes: int, candles: List[Candle]) -> Candle:
+    def _get_or_create_candle_for_tf(
+        self, ts: datetime, price: float, volume: int, minutes: int, candles: List[Candle]
+    ) -> Tuple[Candle, Optional[Candle]]:
+        """Returns ``(active_candle, sealed_previous_candle_or_None)``."""
         aligned_ts = ts.replace(minute=(ts.minute // minutes) * minutes, second=0, microsecond=0)
         if not candles or aligned_ts > candles[-1].timestamp:
+            sealed = candles[-1] if candles else None
             candle = Candle(
                 timestamp=aligned_ts,
                 open=price, high=price, low=price, close=price, volume=volume,
                 timeframe=timeframe_label(minutes)
             )
             candles.append(candle)
-            return candle
-        return candles[-1]
+            return candle, sealed
+        return candles[-1], None
 
-    def _is_candle_closed_at(self, candle: Candle, ts: datetime, minutes: int) -> bool:
-        return ts >= candle.timestamp + timedelta(minutes=minutes)
-    
-    def _finalize_candle(self, candle: Candle):
-        """Compute all indicators when candle closes."""
-        closes = [c.close for c in self.candles_15m]
-        
+    def _finalize_candle(self, candle: Candle, series: List[Candle]):
+        """Compute all indicators when candle closes, from its own timeframe's series."""
+        closes = [c.close for c in series]
+
         # Basic indicators
         candle.rsi = indicators.rsi(closes)
         candle.ema_20 = indicators.ema(closes, 20)
         candle.ema_50 = indicators.ema(closes, 50)
         candle.ema_200 = indicators.ema(closes, 200)
         candle.macd, candle.macd_signal, candle.macd_hist = indicators.macd(closes)
-        candle.atr = indicators.atr(self.candles_15m)
-        candle.vwap = indicators.vwap(self.candles_15m)
-        candle.adx = indicators.adx(self.candles_15m)
+        candle.atr = indicators.atr(series)
+        candle.vwap = indicators.vwap(series)
+        candle.adx = indicators.adx(series)
         candle.bb_upper, candle.bb_lower = indicators.bollinger_bands(closes)
     
     async def analyze(self, candle: Candle) -> Dict[str, Any]:

@@ -493,10 +493,19 @@ class FyersBroker(BaseBroker):
             raise ConnectionError(f"Fyers history request failed (HTTP {status})")
 
         candles = []
-        if data.get("s") == "ok":
+        if data.get("s") in ("ok", "no_data"):
+            # "no_data" is a legitimate empty result (e.g. a freshly-listed
+            # instrument), not an error. Fyers can echo back the same bar
+            # twice (seen with cont_flag=1 over wider ranges) - dedupe by
+            # epoch so a repeated bar never renders as a doubled-up candle.
+            seen_epochs = set()
             for c in data.get("candles", []):
+                epoch = c[0]
+                if epoch in seen_epochs:
+                    continue
+                seen_epochs.add(epoch)
                 candles.append(Candle(
-                    timestamp=datetime.utcfromtimestamp(c[0]),
+                    timestamp=datetime.utcfromtimestamp(epoch),
                     open=c[1], high=c[2], low=c[3],
                     close=c[4], volume=c[5],
                     timeframe=label,

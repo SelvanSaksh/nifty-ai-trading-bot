@@ -24,6 +24,11 @@ dist/
 .env.*
 !.env.example
 
+# Runtime data (database, engine lock file, logs) stays out of git.
+# data/fyers_token.txt is kept in the repo on purpose (see the rule at the end).
+data/*
+!data/.gitkeep
+
 # Testing
 .pytest_cache/
 .coverage
@@ -62,3 +67,4 @@ Thumbs.db
 # docker-compose.override.yml
 data/engine.lock
 *.lock
+!data/fyers_token.txt
