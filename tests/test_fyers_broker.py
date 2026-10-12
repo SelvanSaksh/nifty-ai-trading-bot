@@ -153,8 +153,9 @@ class TestDataSocketLogDir:
         broker = FyersBroker.__new__(FyersBroker)
         broker._loop = None
         broker._data_socket = None
-        broker._pending_symbols = []
+        broker._wanted_symbols = []
         broker._subscribed_symbols = set()
+        broker._socket_generation = 0
         broker.tick_callback = None
         socket = broker._build_data_socket(FakeDataWs, "APP-200:header.payload.sig")
         assert socket is not None

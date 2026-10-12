@@ -196,12 +196,15 @@ class NiftyBot:
         refresher = getattr(self.broker, "reauthenticate", None)
         if refresher is None:
             return
-        await refresher()
-        if self.is_running:
-            self.broker.tick_callback = self._on_tick
-            if self._all_symbols:
-                await self.broker.subscribe_ticks(self._all_symbols)
-                print(f"[BOT] Resubscribed to {len(self._all_symbols)} symbols after re-login")
+        # Serialized with start/stop and the live-feed watchdog, which would
+        # otherwise rebuild the socket at the same moment.
+        async with self._lock:
+            await refresher()
+            if self.is_running:
+                self.broker.tick_callback = self._on_tick
+                if self._all_symbols:
+                    await self.broker.subscribe_ticks(self._all_symbols)
+                    print(f"[BOT] Resubscribed to {len(self._all_symbols)} symbols after re-login")
 
     # ── Active symbol ─────────────────────────────────────────────
 
@@ -397,6 +400,21 @@ class NiftyBot:
                 raise
             except Exception as exc:
                 print(f"[BOT] Symbol reconcile failed: {exc}")
+            try:
+                await self._watch_live_feed()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[BOT] Live feed check failed: {exc}")
+
+    async def _watch_live_feed(self):
+        """Rebuild the broker's tick socket if it went silent in market hours."""
+        ensure = getattr(self.broker, "ensure_live_feed", None)
+        if ensure is None or not self.is_running:
+            return
+        async with self._lock:
+            if self.is_running:
+                await ensure()
 
     async def _reconcile_once(self) -> bool:
         if not self.is_running:

@@ -55,3 +55,15 @@ docker compose logs bot | grep -i "data socket"
 #    -> "[FYERS] Live data socket subscribed to N symbols" (during market hours)
 #    Socket logs: docker compose exec bot ls -l /app/logs
 #    The old host ./logs folder is no longer used and can be deleted.
+
+# 12. Live ticks after a re-login / restart
+#    Every (re)connect of the Fyers data socket now subscribes ALL symbols
+#    (the SDK forgets subscriptions when it reconnects), a re-login replaces the
+#    socket with a brand-new one, and if no tick arrives for 2 minutes during
+#    market hours (09:15-15:30 IST) the socket is rebuilt automatically.
+#    Logging in via /api/auth/login also starts the engine if it failed to start
+#    at boot because the token had expired.
+docker compose logs -f bot | grep -E "FYERS|AUTH"
+#    -> "[FYERS] Live data socket subscribed to N symbols" after each login/reconnect
+#    -> "[FYERS] No live ticks for 120s during market hours - rebuilding data socket"
+#       only if the feed stalls (should be rare)

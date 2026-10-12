@@ -173,6 +173,17 @@ async def fyers_auth_callback(request: Request):
                 await bot.reauthenticate()
             except Exception as exc:
                 print(f"[AUTH] Failed to re-arm the broker with the new token: {exc}")
+            # Booted with an expired token: the engine never started, so the
+            # new token alone would bring back neither ticks nor live candles.
+            # (An engine stopped on purpose has no startup_error and stays off.)
+            if not bot.is_running and getattr(app.state, "startup_error", None):
+                try:
+                    await bot.start()
+                    app.state.startup_error = None
+                    print("[AUTH] Engine started with the new token")
+                except Exception as exc:
+                    app.state.startup_error = str(exc)
+                    print(f"[AUTH] Engine still cannot start: {exc}")
 
         # `state` travels through Fyers, so it may come back decoded (normal) or
         # still percent-encoded; accept either, but never a foreign origin.

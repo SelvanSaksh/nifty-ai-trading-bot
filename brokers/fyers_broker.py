@@ -58,6 +58,30 @@ def writable_log_dir(preferred: Optional[str] = None) -> str:
     return tempfile.gettempdir()
 
 
+#: Silence on the live feed (during market hours) after which the data socket
+#: is treated as dead and rebuilt. Indices tick several times a second.
+TICK_STALL_SECONDS = 120
+#: Longest wait between rebuild attempts while the feed stays silent (e.g. a
+#: market holiday, when no ticks are expected at all).
+MAX_FEED_RETRY_SECONDS = 900
+#: ``close_connection`` joins the SDK's threads without a timeout.
+SOCKET_CLOSE_TIMEOUT = 15
+#: Reconnect attempts the SDK makes on its own before giving up (its default
+#: of 5 is used up by one short network outage, after which it never
+#: reconnects again).
+SOCKET_RECONNECT_RETRY = 50
+
+
+def nse_session_open(now_utc: Optional[datetime] = None) -> bool:
+    """True during the NSE cash session (Mon-Fri 09:15-15:30 IST)."""
+    now = now_utc or datetime.utcnow()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    # 09:15 IST = 03:45 UTC, 15:30 IST = 10:00 UTC.
+    return 3 * 60 + 45 <= minutes < 10 * 60
+
+
 def normalize_tick(msg: Any) -> Optional[Dict[str, Any]]:
     """Map a Fyers data-socket payload onto the tick shape the engine consumes.
 
@@ -96,8 +120,17 @@ class FyersBroker(BaseBroker):
         self.is_connected = False
         self._headers = {}
         self._data_socket = None
+        # Every symbol the engine wants ticks for. The SDK forgets its
+        # subscriptions whenever it reconnects, so this list - not "what is
+        # still pending" - is what each (re)connect subscribes.
+        self._wanted_symbols: List[str] = []
         self._subscribed_symbols: set = set()
-        self._pending_symbols: List[str] = []
+        # Bumped for every socket built or closed; callbacks of an older
+        # socket see a different number and stay silent instead of doubling ticks.
+        self._socket_generation = 0
+        self._last_tick_at: Optional[float] = None
+        self._socket_started_at: Optional[float] = None
+        self._feed_retry_seconds = TICK_STALL_SECONDS
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Authorization value the current session was built with, so a re-login
         # can be noticed and the session rebuilt.
@@ -144,15 +177,9 @@ class FyersBroker(BaseBroker):
             await self.session.close()
         self.session = None
         self._auth_token = None
-
-        socket, self._data_socket = self._data_socket, None
-        self._subscribed_symbols.clear()
-        self._pending_symbols = []
-        if socket is not None:
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, socket.close_connection)
-            except Exception as e:
-                print(f"[FYERS] Data socket close failed: {e}")
+        # The socket authenticated with the old token and must be replaced,
+        # but the symbols it served are still wanted.
+        await self._close_data_socket()
     
     async def connect(self) -> bool:
         """Validate token by fetching profile."""
@@ -206,44 +233,87 @@ class FyersBroker(BaseBroker):
     
     async def disconnect(self):
         self.is_connected = False
-        socket, self._data_socket = self._data_socket, None
-        self._subscribed_symbols.clear()
-        self._pending_symbols = []
-        if socket is not None:
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, socket.close_connection)
-            except Exception as e:
-                print(f"[FYERS] Data socket close failed: {e}")
+        self._wanted_symbols = []
+        await self._close_data_socket()
         if self.session:
             await self.session.close()
             self.session = None
+
+    async def _close_data_socket(self) -> None:
+        """Stop the current data socket for good (no SDK auto-reconnect)."""
+        socket, self._data_socket = self._data_socket, None
+        self._socket_generation += 1  # silence callbacks still in flight
+        self._subscribed_symbols.clear()
+        self._socket_started_at = None
+        if socket is None:
+            return
+        # close_connection() only acts while the socket is *connected*: a
+        # socket inside its own reconnect loop kept reconnecting next to the
+        # new one (two feeds, one of them on the old token).
+        try:
+            socket.restart_flag = False
+        except Exception:
+            pass
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, socket.close_connection), SOCKET_CLOSE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            print("[FYERS] Data socket did not close in time; abandoning it")
+        except Exception as e:
+            print(f"[FYERS] Data socket close failed: {e}")
 
     def _build_data_socket(self, data_ws, token: str):
         """Official Fyers data socket wired into the engine's tick callback."""
         # The SDK decodes the JWT itself, so the "APP-200:" prefix must be stripped.
         jwt = token.split(":", 1)[1] if ":" in token else token
         loop = self._loop
+        self._socket_generation += 1
+        generation = self._socket_generation
+        holder: Dict[str, Any] = {}
+
+        def _current() -> bool:
+            return generation == self._socket_generation
 
         def _on_connect():
+            # Fires on the first connect AND after every SDK auto-reconnect.
+            # The SDK drops all its subscriptions when it reconnects, so the
+            # full wanted list is subscribed every time. (Subscribing only the
+            # symbols still "pending" left every reconnected socket - after a
+            # re-login, restart or network blip - with nothing subscribed.)
+            socket = holder.get("socket")
             try:
+                if socket is None:
+                    return
+                if not _current():
+                    # An orphan from before a re-login/restart came back up.
+                    socket.restart_flag = False
+                    socket.close_connection()
+                    return
                 # connect() sleeps 2s before this fires; wait for the handshake so
                 # the subscribe frames are not wiped by the socket's startup queue.
                 for _ in range(50):
-                    if self._data_socket is None or self._data_socket.is_connected():
+                    if socket.is_connected():
                         break
                     time.sleep(0.1)
-                pending = list(self._pending_symbols)
-                if pending and self._data_socket is not None:
-                    self._data_socket.subscribe(symbols=pending, data_type="SymbolUpdate")
-                    self._subscribed_symbols.update(pending)
-                    self._pending_symbols = []
-                    print(f"[FYERS] Live data socket subscribed to {len(pending)} symbols")
+                symbols = list(self._wanted_symbols)
+                if symbols:
+                    socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
+                    self._subscribed_symbols = set(symbols)
+                    print(f"[FYERS] Live data socket subscribed to {len(symbols)} symbols")
             except Exception as e:
                 print(f"[FYERS] Data socket subscribe failed: {e}")
 
         def _on_message(msg):
+            if not _current():
+                return
             tick = normalize_tick(msg)
-            if tick is None or self.tick_callback is None:
+            if tick is None:
+                return
+            self._last_tick_at = time.monotonic()
+            self._feed_retry_seconds = TICK_STALL_SECONDS
+            if self.tick_callback is None or loop is None:
                 return
             # Runs on the SDK's reader thread — hand the coroutine to the loop.
             asyncio.run_coroutine_threadsafe(self.tick_callback(tick), loop)
@@ -254,48 +324,43 @@ class FyersBroker(BaseBroker):
         def _on_close(msg):
             print(f"[FYERS WS] closed: {msg}")
 
-        return data_ws.FyersDataSocket(
+        # FyersDataSocket is a singleton: constructing it again re-ran __init__
+        # on the *same* object while the old socket's threads were still using
+        # it (resetting their reconnect flag and token underneath them). Every
+        # socket built here must be a new object.
+        socket_class = data_ws.FyersDataSocket
+        if hasattr(socket_class, "_instance"):
+            socket_class._instance = None
+
+        socket = socket_class(
             access_token=jwt,
             log_path=writable_log_dir(),
             litemode=False,
             write_to_file=False,
             reconnect=True,
+            reconnect_retry=SOCKET_RECONNECT_RETRY,
             on_connect=_on_connect,
             on_message=_on_message,
             on_error=_on_error,
             on_close=_on_close,
         )
+        holder["socket"] = socket
+        return socket
 
     async def subscribe_ticks(self, symbols: list[str]):
         """Live ticks via the official Fyers data socket (HSM feed)."""
         loop = asyncio.get_running_loop()
         self._loop = loop
-
-        token = self._get_auth_header()
-        if not token:
-            print("[FYERS] No access token — run `python fyers_auth.py` or GET /api/auth/login")
-            return
-
-        try:
-            from fyers_apiv3.FyersWebsocket import data_ws
-        except ImportError as e:
-            print(f"[FYERS] fyers-apiv3 unavailable ({e}); live ticks are disabled")
-            return
+        for symbol in symbols:
+            if symbol not in self._wanted_symbols:
+                self._wanted_symbols.append(symbol)
 
         if self._data_socket is None:
-            self._pending_symbols = list(symbols)
-            try:
-                # Building the socket can fail too (it opens its log file);
-                # that must cost live ticks, not the whole engine.
-                self._data_socket = self._build_data_socket(data_ws, token)
-                await loop.run_in_executor(None, self._data_socket.connect)
-            except Exception as e:
-                print(f"[FYERS] Data socket unavailable, live ticks disabled: {e}")
-                self._data_socket = None
+            await self._open_data_socket()
             return
 
         # Socket already running: only add the symbols added since last time.
-        missing = [s for s in symbols if s not in self._subscribed_symbols]
+        missing = [s for s in self._wanted_symbols if s not in self._subscribed_symbols]
         if not missing:
             return
         socket = self._data_socket
@@ -307,6 +372,61 @@ class FyersBroker(BaseBroker):
             print(f"[FYERS] Data socket subscribe failed: {e}")
         else:
             self._subscribed_symbols.update(missing)
+
+    async def _open_data_socket(self) -> bool:
+        """Build and connect a data socket for every wanted symbol."""
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        self._last_tick_at = None
+        # Starts the stall clock even when the build fails, so the watchdog retries.
+        self._socket_started_at = time.monotonic()
+
+        token = self._get_auth_header()
+        if not token:
+            print("[FYERS] No access token — run `python fyers_auth.py` or GET /api/auth/login")
+            return False
+
+        try:
+            from fyers_apiv3.FyersWebsocket import data_ws
+        except ImportError as e:
+            print(f"[FYERS] fyers-apiv3 unavailable ({e}); live ticks are disabled")
+            return False
+
+        try:
+            # Building the socket can fail too (it opens its log file);
+            # that must cost live ticks, not the whole engine.
+            self._data_socket = self._build_data_socket(data_ws, token)
+            await loop.run_in_executor(None, self._data_socket.connect)
+        except Exception as e:
+            print(f"[FYERS] Data socket unavailable, live ticks disabled: {e}")
+            self._data_socket = None
+            return False
+        return True
+
+    def feed_stalled(self, now: Optional[float] = None, now_utc: Optional[datetime] = None) -> bool:
+        """True when the market is open but no tick arrived for too long.
+
+        Catches every way the feed dies without an error reaching the engine:
+        the SDK giving up after its reconnect attempts, a socket that came back
+        without subscriptions, or Fyers dropping the connection server side.
+        """
+        if not self._wanted_symbols or not nse_session_open(now_utc):
+            return False
+        now = time.monotonic() if now is None else now
+        last = self._last_tick_at or self._socket_started_at
+        return last is None or now - last >= self._feed_retry_seconds
+
+    async def ensure_live_feed(self) -> bool:
+        """Rebuild the data socket when the feed has stalled. True if rebuilt."""
+        if not self.feed_stalled():
+            return False
+        silent = self._feed_retry_seconds
+        print(f"[FYERS] No live ticks for {silent}s during market hours — rebuilding data socket")
+        await self._close_data_socket()
+        # Back off while it stays silent (holiday, Fyers outage); a tick resets it.
+        self._feed_retry_seconds = min(silent * 2, MAX_FEED_RETRY_SECONDS)
+        await self._open_data_socket()
+        return True
     
     async def _rejects_current_token(self, status: int) -> bool:
         """True when Fyers said these credentials are unusable.
