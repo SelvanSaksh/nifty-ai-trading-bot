@@ -6,6 +6,7 @@ from models.enums import Direction
 from utils import indicators
 from utils.helpers import timeframe_label
 from utils.patterns import detect_candlestick_patterns
+from utils.market_structure import analyze_structure, closed_candles
 from features.options import options_analyzer
 from features.news import news_monitor
 
@@ -113,6 +114,11 @@ class Analyzer:
         
         # Market context
         market_context = await self._get_market_context()
+
+        # HH/HL/LH/LL structure from closed 15m candles only. Informational:
+        # "tradeable" is False in a ranging (mixed) market.
+        closed_15m = closed_candles(self.candles_15m, 15, datetime.utcnow())
+        market_structure = analyze_structure(closed_15m).summary()
         
         return {
             "candle": candle,
@@ -123,6 +129,7 @@ class Analyzer:
             "liquidity_sweep": liquidity_sweep,
             "order_block": order_block,
             "market_context": market_context,
+            "market_structure": market_structure,
             "higher_timeframe_trend": self._higher_timeframe_filter()
         }
     

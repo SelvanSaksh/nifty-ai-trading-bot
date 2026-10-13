@@ -30,8 +30,10 @@ from models.enums import Direction, TradeStatus, SignalResult
 from config import settings
 from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError, SingletonFileLock
+from utils.market_structure import DEFAULT_STRENGTH, analyze_structure, closed_candles
 from utils.helpers import (
     LIVE_TIMEFRAMES,
+    TIMEFRAME_MINUTES,
     RESOLUTION_BY_TIMEFRAME,
     normalize_timeframe,
 )
@@ -613,6 +615,38 @@ class NiftyBot:
             ),
             "error": error,
             "candles": payload,
+        }
+
+    async def get_structure(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 200,
+        strength: int = DEFAULT_STRENGTH,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Market structure (swings, BOS/CHoCH, zones) of the closed candles.
+
+        The candle still forming is left out: structure is only confirmed on
+        closed candles. The chart previews the forming candle against
+        ``watch`` itself.
+        """
+        strength = int(strength)
+        if strength < 1 or strength > 10:
+            raise ValueError("strength must be between 1 and 10")
+        data = await self.get_candles(timeframe=timeframe, limit=limit, symbol=symbol)
+        minutes = TIMEFRAME_MINUTES[data["timeframe"]]
+        candles = data["candles"]
+        closed = closed_candles(candles, minutes, now or datetime.utcnow())
+        structure = analyze_structure(closed, strength)
+        return {
+            "symbol": data["symbol"],
+            "symbol_name": data["symbol_name"],
+            "timeframe": data["timeframe"],
+            "source": data["source"],
+            "error": data["error"],
+            "forming_excluded": len(closed) < len(candles),
+            **structure.to_dict(),
         }
 
     @staticmethod

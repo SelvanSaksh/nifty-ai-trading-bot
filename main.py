@@ -347,6 +347,30 @@ async def get_candles_detail(
     return await _load_candles(timeframe, limit, symbol, end_time)
 
 
+@app.get("/api/structure")
+async def get_market_structure(
+    symbol: str,
+    timeframe: str,
+    limit: int = 200,
+    strength: int = 3,
+):
+    """HH/HL/LH/LL swings, BOS/CHoCH and S/R zones from *closed* candles.
+
+    Confirmed structure never changes once returned. ``watch`` holds the
+    levels a chart may preview the live (forming) candle against.
+    """
+    if not (symbol or "").strip():
+        raise HTTPException(status_code=422, detail="symbol is required")
+    if not (timeframe or "").strip():
+        raise HTTPException(status_code=422, detail="timeframe is required")
+    try:
+        return await app.state.bot.get_structure(
+            symbol=symbol.strip(), timeframe=timeframe.strip(), limit=limit, strength=strength
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
 # ── Market Context ──────────────────────────────────────────────
 
 @app.get("/api/market-context")
