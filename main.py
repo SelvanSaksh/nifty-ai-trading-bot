@@ -336,6 +336,27 @@ async def get_candles(
     return result["candles"]
 
 
+@app.get("/api/candles/range")
+async def get_candles_range(
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: Optional[str] = None,
+):
+    """Every candle between ``start`` and ``end`` (ISO, default now) - no
+    candle-count limit. Same envelope as /api/candles/detail."""
+    if not (symbol or "").strip():
+        raise HTTPException(status_code=422, detail="symbol is required")
+    if not (timeframe or "").strip():
+        raise HTTPException(status_code=422, detail="timeframe is required")
+    try:
+        return await app.state.bot.get_candles_range(
+            symbol=symbol.strip(), timeframe=timeframe.strip(), start=start, end=end
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
 @app.get("/api/candles/detail")
 async def get_candles_detail(
     symbol: str,

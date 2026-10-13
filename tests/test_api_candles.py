@@ -171,3 +171,33 @@ def test_active_symbol_endpoint_and_candles_agree(client):
         assert candles.headers["X-Symbol-Version"] == str(state["version"])
         values.add((state["symbol"], state["version"]))
     assert len(values) == 1, f"active symbol churned between polls: {values}"
+
+
+def test_range_returns_every_candle_between_two_times(client):
+    resp = client.get(
+        "/api/candles/range",
+        params={
+            "symbol": "NSE:NIFTY50-INDEX",
+            "timeframe": "5m",
+            "start": "2026-09-01T00:00:00",
+            "end": "2026-09-30T23:59:00",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["error"] is None
+    # A whole month of 5m session bars - far more than one 200-candle window.
+    assert body["count"] == len(body["candles"]) > 1000
+    times = [c["timestamp"] for c in body["candles"]]
+    assert times == sorted(times) and len(set(times)) == len(times)
+    assert times[0] >= "2026-09-01" and times[-1] <= "2026-09-30T23:59:00"
+    assert all(c["symbol"] == "NSE:NIFTY50-INDEX" and c["timeframe"] == "5m" for c in body["candles"])
+
+
+def test_range_validates_its_bounds(client):
+    base = {"symbol": "NSE:NIFTY50-INDEX", "timeframe": "5m"}
+    assert client.get("/api/candles/range", params=base).status_code == 422
+    backwards = {**base, "start": "2026-09-30T00:00:00", "end": "2026-09-01T00:00:00"}
+    assert client.get("/api/candles/range", params=backwards).status_code == 422
+    too_wide = {**base, "start": "2024-01-01T00:00:00", "end": "2026-01-01T00:00:00"}
+    assert client.get("/api/candles/range", params=too_wide).status_code == 422

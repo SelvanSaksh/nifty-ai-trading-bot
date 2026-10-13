@@ -1,7 +1,7 @@
 import asyncio
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -614,6 +614,63 @@ class NiftyBot:
             "timeframe": tf,
             "limit": limit,
             "source": source,
+            "count": len(payload),
+            "coverage": (
+                {"start": payload[0]["timestamp"], "end": payload[-1]["timestamp"]}
+                if payload
+                else None
+            ),
+            "error": error,
+            "candles": payload,
+        }
+
+    #: Widest window one /api/candles/range call may ask for.
+    MAX_RANGE_DAYS = 400
+
+    async def get_candles_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: Any,
+        end: Any = None,
+    ) -> Dict[str, Any]:
+        """Every candle of ``symbol`` between ``start`` and ``end`` (default:
+        now) - no candle-count limit. Charts page older history with it."""
+        tf = normalize_timeframe(timeframe)
+        target = str(symbol or "").strip().upper()
+        self._validate_symbol_format(target)
+        start_dt = self._parse_end_time(start)
+        if start_dt is None:
+            raise ValueError("start is required")
+        end_dt = self._parse_end_time(end) or datetime.utcnow()
+        if end_dt < start_dt:
+            raise ValueError("end must not be before start")
+        if end_dt - start_dt > timedelta(days=self.MAX_RANGE_DAYS):
+            raise ValueError(f"a range may span at most {self.MAX_RANGE_DAYS} days")
+
+        active_state = await get_active_symbol_state()
+        target_name = self._symbol_name_for(target)
+        error: Optional[str] = None
+        candles: List[Candle] = []
+        try:
+            candles = await self.broker.get_history_range(
+                target, RESOLUTION_BY_TIMEFRAME[tf], start_dt, end_dt
+            )
+        except Exception as exc:
+            error = str(exc)
+
+        payload = [
+            {**c.model_dump(), "symbol": target, "symbol_name": target_name, "timeframe": tf}
+            for c in candles
+        ]
+        return {
+            "symbol": target,
+            "symbol_name": target_name,
+            "symbol_version": active_state["version"],
+            "active_symbol": active_state["symbol"],
+            "timeframe": tf,
+            "limit": len(payload),
+            "source": "history",
             "count": len(payload),
             "coverage": (
                 {"start": payload[0]["timestamp"], "end": payload[-1]["timestamp"]}
