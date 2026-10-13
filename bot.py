@@ -30,7 +30,7 @@ from models.enums import Direction, TradeStatus, SignalResult
 from config import settings
 from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError, SingletonFileLock
-from utils.market_structure import DEFAULT_STRENGTH, analyze_structure, closed_candles
+from utils.market_structure import DEFAULT_STRENGTH, StructureTracker, closed_candles
 from utils.helpers import (
     LIVE_TIMEFRAMES,
     TIMEFRAME_MINUTES,
@@ -60,6 +60,10 @@ class NiftyBot:
     # How often the engine checks the shared DB for symbol changes made by
     # another process (single writer, shared state).
     RECONCILE_INTERVAL = 5.0
+    # Market structure: how often new candles are fetched per series, and
+    # how many series stay in memory.
+    STRUCTURE_REFRESH_SECONDS = 5.0
+    STRUCTURE_MAX_SERIES = 24
 
     def __init__(self):
         mode = settings.BROKER_MODE.strip().lower()
@@ -99,6 +103,9 @@ class NiftyBot:
         self._reconcile_task: Optional[asyncio.Task] = None
         self._pending_symbol_state: Optional[Dict[str, Any]] = None
         self._history_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Market structure per (symbol, timeframe, strength), fed incrementally.
+        self._structure_cache: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        self._structure_locks: Dict[Tuple[str, str, int], asyncio.Lock] = {}
 
         # Multi-symbol watchlist live quotes: {symbol: {ltp, change, change_pct, open, high, low, volume, name, instrument_type}}
         self.watchlist_quotes: Dict[str, Dict[str, Any]] = {}
@@ -617,36 +624,73 @@ class NiftyBot:
             "candles": payload,
         }
 
+    def _structure_start(self) -> datetime:
+        """Session open (09:15 IST = 03:45 UTC) on ``STRUCTURE_START``."""
+        day = datetime.fromisoformat(str(settings.STRUCTURE_START).strip()[:10])
+        return day.replace(hour=3, minute=45, second=0, microsecond=0)
+
     async def get_structure(
         self,
         symbol: str,
         timeframe: str,
-        limit: int = 200,
+        since: Any = None,
         strength: int = DEFAULT_STRENGTH,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
-        """Market structure (swings, BOS/CHoCH, zones) of the closed candles.
+        """Market structure (swings, BOS/CHoCH, zones) of every closed candle
+        since ``STRUCTURE_START`` - no fixed candle count.
 
-        The candle still forming is left out: structure is only confirmed on
-        closed candles. The chart previews the forming candle against
-        ``watch`` itself.
+        The start never moves, so a confirmed swing, BOS or CHoCH can never
+        change afterwards. Each series is kept in memory and only new closed
+        candles are fetched and fed in. The candle still forming is left out;
+        the chart previews it against ``watch``. ``since`` only trims which
+        swings and breaks are returned (what the chart can show).
         """
         strength = int(strength)
         if strength < 1 or strength > 10:
             raise ValueError("strength must be between 1 and 10")
-        data = await self.get_candles(timeframe=timeframe, limit=limit, symbol=symbol)
-        minutes = TIMEFRAME_MINUTES[data["timeframe"]]
-        candles = data["candles"]
-        closed = closed_candles(candles, minutes, now or datetime.utcnow())
-        structure = analyze_structure(closed, strength)
+        tf = normalize_timeframe(timeframe)
+        target = str(symbol or "").strip().upper()
+        self._validate_symbol_format(target)
+        since_dt = self._parse_end_time(since)
+        now = now or datetime.utcnow()
+
+        key = (target, tf, strength)
+        lock = self._structure_locks.setdefault(key, asyncio.Lock())
+        error: Optional[str] = None
+        async with lock:
+            entry = self._structure_cache.pop(key, None) or {
+                "tracker": StructureTracker(strength),
+                "fetched": None,
+            }
+            tracker: StructureTracker = entry["tracker"]
+            fetched = entry["fetched"]
+            if fetched is None or time.monotonic() - fetched >= self.STRUCTURE_REFRESH_SECONDS:
+                start = tracker.last_time or self._structure_start()
+                try:
+                    raw = await self.broker.get_history_range(
+                        target, RESOLUTION_BY_TIMEFRAME[tf], start, now
+                    )
+                    tracker.feed(closed_candles(raw, TIMEFRAME_MINUTES[tf], now))
+                    entry["fetched"] = time.monotonic()
+                except Exception as exc:
+                    error = str(exc)
+            # Most recently used last; the oldest series is dropped first.
+            self._structure_cache[key] = entry
+            while len(self._structure_cache) > self.STRUCTURE_MAX_SERIES:
+                oldest = next(iter(self._structure_cache))
+                self._structure_cache.pop(oldest)
+                self._structure_locks.pop(oldest, None)
+            structure = tracker.result()
+
         return {
-            "symbol": data["symbol"],
-            "symbol_name": data["symbol_name"],
-            "timeframe": data["timeframe"],
-            "source": data["source"],
-            "error": data["error"],
-            "forming_excluded": len(closed) < len(candles),
-            **structure.to_dict(),
+            "symbol": target,
+            "symbol_name": self._symbol_name_for(target),
+            "timeframe": tf,
+            "start": self._structure_start().isoformat(),
+            "error": error,
+            "summary": structure.summary(),
+            **structure.to_dict(since_dt),
         }
 
     @staticmethod
@@ -766,6 +810,14 @@ class NiftyBot:
         
         # Run analysis
         analysis = await self.analyzer.analyze(candle)
+        # Use the same structure the chart shows (every candle since
+        # STRUCTURE_START) rather than the analyzer's short live buffer.
+        try:
+            shared = await self.get_structure(self.symbol, "15m")
+            if not shared["error"]:
+                analysis["market_structure"] = shared["summary"]
+        except Exception as exc:
+            print(f"[BOT] Market structure unavailable: {exc}")
         
         # Decision engine
         signal = self.decision_engine.evaluate(analysis)

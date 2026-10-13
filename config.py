@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     
     # ── Trading Configuration ───────────────────────────────────
     TRADING_SYMBOL: str = "NSE:NIFTY50-INDEX"
+    # Market structure is computed from every candle since this date (IST),
+    # never from a fixed number of recent candles: a fixed start keeps every
+    # confirmed swing, BOS and CHoCH stable for good.
+    STRUCTURE_START: str = "2026-01-01"
     TRADING_SYMBOL_NAME: str = "Nifty 50"
     PAPER_TRADING: bool = True
     CAPITAL: float = 100_000.0

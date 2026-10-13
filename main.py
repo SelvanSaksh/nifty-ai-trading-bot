@@ -351,13 +351,16 @@ async def get_candles_detail(
 async def get_market_structure(
     symbol: str,
     timeframe: str,
-    limit: int = 200,
+    since: Optional[str] = None,
     strength: int = 3,
 ):
-    """HH/HL/LH/LL swings, BOS/CHoCH and S/R zones from *closed* candles.
+    """HH/HL/LH/LL swings, BOS/CHoCH and S/R zones from every *closed* candle
+    since ``STRUCTURE_START`` (no candle limit).
 
-    Confirmed structure never changes once returned. ``watch`` holds the
-    levels a chart may preview the live (forming) candle against.
+    Confirmed structure never changes once returned. ``since`` (ISO time)
+    only trims the swings/breaks sent back to what a chart starting there can
+    show. ``watch`` holds the levels a chart may preview the forming candle
+    against.
     """
     if not (symbol or "").strip():
         raise HTTPException(status_code=422, detail="symbol is required")
@@ -365,7 +368,7 @@ async def get_market_structure(
         raise HTTPException(status_code=422, detail="timeframe is required")
     try:
         return await app.state.bot.get_structure(
-            symbol=symbol.strip(), timeframe=timeframe.strip(), limit=limit, strength=strength
+            symbol=symbol.strip(), timeframe=timeframe.strip(), since=since, strength=strength
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))

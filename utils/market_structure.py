@@ -195,7 +195,11 @@ class MarketStructure:
             "last_low": self.last_low.price if self.last_low else None,
         }
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, since: Optional[datetime] = None) -> Dict[str, Any]:
+        """``since`` limits swings and breaks to those a chart starting there
+        can show (a break counts when its closing candle is in view)."""
+        swings = self.swings if since is None else [s for s in self.swings if s.time >= since]
+        breaks = self.breaks if since is None else [b for b in self.breaks if b.time >= since]
         return {
             "strength": self.strength,
             "trend": self.trend,
@@ -203,8 +207,8 @@ class MarketStructure:
             "sequence": self.sequence,
             "last_closed_time": _iso(self.last_closed_time),
             "candles_used": self.candles_used,
-            "swings": [s.to_dict() for s in self.swings],
-            "breaks": [b.to_dict() for b in self.breaks],
+            "swings": [s.to_dict() for s in swings],
+            "breaks": [b.to_dict() for b in breaks],
             "zones": [z.to_dict() for z in self.zones],
             "watch": self.watch(),
         }
@@ -261,7 +265,7 @@ class _Detector:
         self.n = strength
         self.swings: List[Swing] = []
         self.breaks: List[StructureBreak] = []
-        self.zones: List[Zone] = []
+        self.zones: List[Zone] = []  # active (unbroken) zones only
         self.trend = "none"
         self.confirmed = False
         # Candle index of the CHoCH awaiting confirmation: only a swing formed
@@ -410,13 +414,15 @@ class _Detector:
                 self._record("CHoCH", "down", low, k)
                 self.trend, self.confirmed, self.choch_index = "down", False, k
 
+        still_active = []
         for zone in self.zones:
-            if zone.broken_time is not None:
-                continue
             if (zone.kind == "resistance" and close > zone.top) or (
                 zone.kind == "support" and close < zone.bottom
             ):
                 zone.broken_time = bar.time
+            else:
+                still_active.append(zone)
+        self.zones = still_active
 
     def _record(self, kind: str, direction: str, swing: Swing, k: int) -> None:
         bar = self.bars[k]
@@ -435,33 +441,45 @@ class _Detector:
 
     # ── driver ──────────────────────────────────────────────────
     def run(self) -> MarketStructure:
-        n = self.n
         for k in range(len(self.bars)):
-            # Breaks first, against the structure as it stood before candle k
-            # closed - exactly the levels the chart was previewing (``watch``)
-            # while k was forming, so a preview and its confirmation agree.
-            self._check_breaks(k)
-            # Candle k closing confirms (or rejects) the pivot n bars back.
-            p = k - n
-            if p >= n:
-                is_high = self._pivot_high(p)
-                is_low = self._pivot_low(p)
-                if is_high and is_low:
-                    last = self.swings[-1] if self.swings else None
-                    if last is not None:
-                        order = ("low", "high") if last.kind == "high" else ("high", "low")
-                    else:
-                        # An outside bar: a green one made its low first.
-                        bar = self.bars[p]
-                        order = ("low", "high") if bar.close >= bar.open else ("high", "low")
-                    for kind in order:
-                        self._add_pivot(kind, p, k)
-                elif is_high:
-                    self._add_pivot("high", p, k)
-                elif is_low:
-                    self._add_pivot("low", p, k)
+            self.step(k)
+        return self.result()
 
-        active = [z for z in self.zones if z.broken_time is None]
+    def append(self, bar: Bar) -> None:
+        """Feed the next closed bar (incremental use)."""
+        self.bars.append(bar)
+        self.step(len(self.bars) - 1)
+
+    def step(self, k: int) -> None:
+        """Process candle ``k`` closing - all state depends only on bars <= k."""
+        n = self.n
+        # Breaks first, against the structure as it stood before candle k
+        # closed - exactly the levels the chart was previewing (``watch``)
+        # while k was forming, so a preview and its confirmation agree.
+        self._check_breaks(k)
+        # Candle k closing confirms (or rejects) the pivot n bars back.
+        p = k - n
+        if p >= n:
+            is_high = self._pivot_high(p)
+            is_low = self._pivot_low(p)
+            if is_high and is_low:
+                last = self.swings[-1] if self.swings else None
+                if last is not None:
+                    order = ("low", "high") if last.kind == "high" else ("high", "low")
+                else:
+                    # An outside bar: a green one made its low first.
+                    bar = self.bars[p]
+                    order = ("low", "high") if bar.close >= bar.open else ("high", "low")
+                for kind in order:
+                    self._add_pivot(kind, p, k)
+            elif is_high:
+                self._add_pivot("high", p, k)
+            elif is_low:
+                self._add_pivot("low", p, k)
+
+    def result(self) -> MarketStructure:
+        n = self.n
+        active = self.zones
         resistance = [z for z in active if z.kind == "resistance"][-MAX_ZONES_PER_SIDE:]
         support = [z for z in active if z.kind == "support"][-MAX_ZONES_PER_SIDE:]
         zones = sorted(resistance + support, key=lambda z: z.time)
@@ -471,8 +489,8 @@ class _Detector:
 
         return MarketStructure(
             strength=n,
-            swings=self.swings,
-            breaks=self.breaks,
+            swings=list(self.swings),
+            breaks=list(self.breaks),
             zones=zones,
             trend=self.trend,
             trend_confirmed=self.trend != "none" and self.confirmed,
@@ -482,6 +500,39 @@ class _Detector:
             last_closed_time=self.bars[-1].time if self.bars else None,
             candles_used=len(self.bars),
         )
+
+
+class StructureTracker:
+    """Market structure of one series from a fixed start, fed incrementally.
+
+    Feeding closed bars one batch at a time gives exactly the same result as
+    analysing the whole series at once (the detector is causal), without
+    re-reading months of history on every request.
+    """
+
+    def __init__(self, strength: int = DEFAULT_STRENGTH):
+        if strength < 1:
+            raise ValueError("strength must be at least 1")
+        self._detector = _Detector([], strength)
+
+    @property
+    def last_time(self) -> Optional[datetime]:
+        bars = self._detector.bars
+        return bars[-1].time if bars else None
+
+    def feed(self, candles: Iterable[Any]) -> int:
+        """Add closed candles newer than the last one fed; returns how many."""
+        added = 0
+        for bar in sorted(to_bars(candles), key=lambda b: b.time):
+            last = self.last_time
+            if last is not None and bar.time <= last:
+                continue
+            self._detector.append(bar)
+            added += 1
+        return added
+
+    def result(self) -> MarketStructure:
+        return self._detector.result()
 
 
 def analyze_structure(candles: Iterable[Any], strength: int = DEFAULT_STRENGTH) -> MarketStructure:

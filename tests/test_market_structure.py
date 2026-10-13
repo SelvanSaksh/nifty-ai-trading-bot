@@ -4,7 +4,9 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from config import settings
 from utils.market_structure import (
+    StructureTracker,
     analyze_structure,
     bar_end,
     closed_candles,
@@ -302,19 +304,48 @@ def test_empty_series():
     assert result.to_dict()["watch"] == {"up": None, "down": None}
 
 
+# ── incremental tracker ─────────────────────────────────────────
+
+@pytest.mark.parametrize("seed", range(15))
+def test_feeding_in_batches_equals_analysing_everything(seed):
+    rng = random.Random(seed)
+    bars = random_bars(seed, count=400)
+    tracker = StructureTracker()
+    i = 0
+    while i < len(bars):
+        size = rng.randint(1, 40)
+        # Overlapping batches, like repeated history requests.
+        tracker.feed(bars[max(0, i - rng.randint(0, 5)) : i + size])
+        i += size
+    assert tracker.result().to_dict() == analyze_structure(bars).to_dict()
+
+
 # ── API ─────────────────────────────────────────────────────────
 
-def test_structure_endpoint_returns_confirmed_structure(client):
+@pytest.fixture
+def recent_start(monkeypatch):
+    # Keep the mock history small: start the structure a few days back.
+    start = (datetime.utcnow() - timedelta(days=6)).strftime("%Y-%m-%d")
+    monkeypatch.setattr(settings, "STRUCTURE_START", start)
+    return start
+
+
+def test_structure_endpoint_returns_confirmed_structure(client, recent_start):
     resp = client.get(
         "/api/structure",
-        params={"symbol": "NSE:NIFTY50-INDEX", "timeframe": "5m", "limit": 200},
+        params={"symbol": "NSE:NIFTY50-INDEX", "timeframe": "5m"},
     )
     assert resp.status_code == 200
     body = resp.json()
+    assert body["error"] is None
     assert body["symbol"] == "NSE:NIFTY50-INDEX" and body["timeframe"] == "5m"
+    assert body["start"].startswith(recent_start)
+    # No 200-candle cap: every session bar since the start is used.
+    assert body["candles_used"] > 200
     assert body["trend"] in ("up", "down", "none")
     assert body["sequence"] in ("up", "down", "mixed", "none")
     assert set(body["watch"]) == {"up", "down"}
+    assert body["swings"], "a few days of 5m bars always contain swings"
     for swing in body["swings"]:
         assert swing["kind"] in ("high", "low")
         assert swing["confirmed_time"] >= swing["time"]
@@ -322,7 +353,18 @@ def test_structure_endpoint_returns_confirmed_structure(client):
         assert b["type"] in ("BOS", "CHoCH")
 
 
-def test_structure_endpoint_validates_input(client):
+def test_since_only_trims_what_is_returned(client, recent_start):
+    params = {"symbol": "NSE:NIFTY50-INDEX", "timeframe": "5m"}
+    full = client.get("/api/structure", params=params).json()
+    cut = full["swings"][len(full["swings"]) // 2]["time"]
+    part = client.get("/api/structure", params={**params, "since": cut}).json()
+    assert part["swings"] == [s for s in full["swings"] if s["time"] >= cut]
+    assert part["breaks"] == [b for b in full["breaks"] if b["time"] >= cut]
+    for key in ("trend", "trend_confirmed", "sequence", "watch", "zones", "candles_used"):
+        assert part[key] == full[key]
+
+
+def test_structure_endpoint_validates_input(client, recent_start):
     bad_strength = client.get(
         "/api/structure",
         params={"symbol": "NSE:NIFTY50-INDEX", "timeframe": "5m", "strength": 0},
@@ -332,27 +374,85 @@ def test_structure_endpoint_validates_input(client):
         "/api/structure", params={"symbol": "NSE:NIFTY50-INDEX", "timeframe": "7m"}
     )
     assert bad_tf.status_code == 422
+    bad_since = client.get(
+        "/api/structure",
+        params={"symbol": "NSE:NIFTY50-INDEX", "timeframe": "5m", "since": "yesterday"},
+    )
+    assert bad_since.status_code == 422
 
 
-async def test_bot_structure_leaves_out_the_forming_candle(monkeypatch):
+class FakeRangeBroker:
+    """History endpoint stand-in that records every requested range."""
+
+    def __init__(self, bars):
+        self.bars = bars
+        self.calls = []
+
+    async def get_history_range(self, symbol, timeframe, start, end):
+        self.calls.append((start, end))
+        return [b for b in self.bars if start <= b["timestamp"] <= end]
+
+
+def make_bot(monkeypatch, bars, start):
     from bot import NiftyBot
 
-    bars = random_bars(3, count=120)
     bot = NiftyBot.__new__(NiftyBot)
+    bot.broker = FakeRangeBroker(bars)
+    bot._structure_cache = {}
+    bot._structure_locks = {}
+    bot.symbol = "NSE:NIFTY50-INDEX"
+    bot.symbol_name = "NIFTY 50"
+    monkeypatch.setattr(settings, "STRUCTURE_START", start)
+    monkeypatch.setattr(NiftyBot, "STRUCTURE_REFRESH_SECONDS", 0.0)
+    return bot
 
-    async def fake_candles(**kwargs):
-        return {
-            "symbol": "NSE:NIFTY50-INDEX",
-            "symbol_name": "NIFTY 50",
-            "timeframe": "5m",
-            "source": "history",
-            "error": None,
-            "candles": [dict(b) for b in bars],
-        }
 
-    monkeypatch.setattr(bot, "get_candles", fake_candles, raising=False)
-    forming_now = bars[-1]["timestamp"] + timedelta(minutes=2)
-    body = await NiftyBot.get_structure(bot, "NSE:NIFTY50-INDEX", "5m", now=forming_now)
-    assert body["forming_excluded"] is True
+async def test_bot_reads_everything_once_then_only_new_candles(monkeypatch):
+    bars = random_bars(5, count=900)  # far more than 200
+    bot = make_bot(monkeypatch, bars, "2026-10-12")
+    after = lambda m: bars[m - 1]["timestamp"] + timedelta(minutes=5)  # bar m-1 closed
+
+    first = await bot.get_structure("NSE:NIFTY50-INDEX", "5m", now=after(600))
+    assert first["candles_used"] == 600
+    assert bot.broker.calls[0][0] == datetime(2026, 10, 12, 3, 45), "starts at the session open"
+
+    second = await bot.get_structure("NSE:NIFTY50-INDEX", "5m", now=after(900))
+    assert second["candles_used"] == 900
+    assert bot.broker.calls[1][0] == bars[599]["timestamp"], "only new candles are fetched"
+    assert {k: v for k, v in second.items() if k != "summary"} == {
+        "symbol": "NSE:NIFTY50-INDEX",
+        "symbol_name": second["symbol_name"],
+        "timeframe": "5m",
+        "start": "2026-10-12T03:45:00",
+        "error": None,
+        **analyze_structure(bars).to_dict(),
+    }
+    # What was confirmed with 600 candles is still there, unchanged.
+    assert second["swings"][: len(first["swings"])] == [
+        {**s, "broken_time": t["broken_time"]} for s, t in zip(first["swings"], second["swings"])
+    ]
+    assert second["breaks"][: len(first["breaks"])] == first["breaks"]
+
+
+async def test_bot_leaves_out_the_forming_candle(monkeypatch):
+    bars = random_bars(3, count=300)
+    bot = make_bot(monkeypatch, bars, "2026-10-12")
+    forming = bars[-1]["timestamp"] + timedelta(minutes=2)
+    body = await bot.get_structure("NSE:NIFTY50-INDEX", "5m", now=forming)
     assert body["candles_used"] == len(bars) - 1
-    assert body == {**body, **analyze_structure(bars[:-1]).to_dict()}
+    assert body["last_closed_time"] == bars[-2]["timestamp"].isoformat()
+
+
+async def test_a_failed_fetch_keeps_the_known_structure(monkeypatch):
+    bars = random_bars(4, count=300)
+    bot = make_bot(monkeypatch, bars, "2026-10-12")
+    end = bars[-1]["timestamp"] + timedelta(minutes=5)
+    good = await bot.get_structure("NSE:NIFTY50-INDEX", "5m", now=end)
+
+    async def broken(*args, **kwargs):
+        raise ConnectionError("Fyers down")
+
+    bot.broker.get_history_range = broken
+    again = await bot.get_structure("NSE:NIFTY50-INDEX", "5m", now=end)
+    assert again["error"] == "Fyers down"
+    assert again["swings"] == good["swings"] and again["trend"] == good["trend"]

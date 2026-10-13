@@ -100,6 +100,45 @@ class FyersBroker(BaseBroker):
             
             await asyncio.sleep(1)
     
+    async def get_history_range(
+        self, symbol: str, timeframe: str, start: datetime, end: datetime
+    ) -> list[Candle]:
+        """Deterministic session candles: the same bar always has the same
+        prices, so repeated / overlapping requests agree like real history."""
+        import math
+
+        from utils.helpers import timeframe_label
+
+        minutes = int(timeframe) if str(timeframe).isdigit() else 15
+        label = timeframe_label(minutes)
+        base = self._DEFAULT_PRICES.get(symbol, 24500.0)
+        seed = sum(ord(ch) for ch in symbol)
+
+        def price(epoch_min: int) -> float:
+            t = epoch_min + seed
+            return base * (1 + 0.004 * math.sin(t / 37.0) + 0.002 * math.sin(t / 11.0) + 0.001 * math.sin(t / 3.1))
+
+        candles = []
+        day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        while day <= end:
+            if day.weekday() < 5:
+                bar = day.replace(hour=3, minute=45)
+                close_at = day.replace(hour=10, minute=0)
+                while bar < close_at:
+                    if start <= bar <= end:
+                        m = int((bar - datetime(1970, 1, 1)).total_seconds() // 60)
+                        o, c = price(m), price(m + minutes)
+                        hi = max(o, c) + abs(price(m + 1) - price(m + 2)) * 3
+                        lo = min(o, c) - abs(price(m + 3) - price(m + 4)) * 3
+                        candles.append(Candle(
+                            timestamp=bar, open=round(o, 2), high=round(hi, 2),
+                            low=round(lo, 2), close=round(c, 2), volume=0,
+                            timeframe=label, symbol=symbol,
+                        ))
+                    bar += timedelta(minutes=minutes)
+            day += timedelta(days=1)
+        return candles
+
     async def get_historical_candles(
         self, 
         symbol: str = "NSE:NIFTY50-INDEX", 

@@ -475,6 +475,54 @@ class FyersBroker(BaseBroker):
             "cont_flag": "1"
         }
 
+        candles = await self._history(session, params, symbol, label)
+
+        if end_time is not None:
+            candles = [c for c in candles if c.timestamp <= end_time]
+
+        candles.sort(key=lambda c: c.timestamp)
+        if limit and len(candles) > limit:
+            candles = candles[-limit:]
+
+        return candles
+
+    #: Fyers serves at most 100 days of intraday candles per request.
+    HISTORY_CHUNK_DAYS = 90
+
+    async def get_history_range(
+        self, symbol: str, timeframe: str, start: datetime, end: datetime
+    ) -> list[Candle]:
+        """Every candle from ``start`` to ``end`` (naive UTC), oldest first.
+
+        Uses epoch bounds (``date_format=0``) so the range is exact, split
+        into chunks the history endpoint accepts.
+        """
+        from utils.helpers import timeframe_label, TIMEFRAME_MINUTES
+
+        session = await self._ensure_session()
+        minutes = int(timeframe) if str(timeframe).isdigit() else TIMEFRAME_MINUTES.get(timeframe, 15)
+        label = timeframe_label(minutes)
+        epoch = datetime(1970, 1, 1)
+        by_time: Dict[datetime, Candle] = {}
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(end, chunk_start + timedelta(days=self.HISTORY_CHUNK_DAYS))
+            params = {
+                "symbol": symbol,
+                "resolution": timeframe,
+                "date_format": "0",
+                "range_from": str(int((chunk_start - epoch).total_seconds())),
+                "range_to": str(int((chunk_end - epoch).total_seconds())),
+                "cont_flag": "1",
+            }
+            for candle in await self._history(session, params, symbol, label):
+                if start <= candle.timestamp <= end:
+                    by_time[candle.timestamp] = candle
+            chunk_start = chunk_end + timedelta(seconds=1)
+        return [by_time[t] for t in sorted(by_time)]
+
+    async def _history(self, session, params: Dict[str, Any], symbol: str, label: str) -> list[Candle]:
+        """One /history request, parsed (auth failures raise FyersAuthError)."""
         async with session.get(f"{self.DATA_URL}/history", params=params) as resp:
             status = resp.status
             # Never `resp.json()` here: a rejected token makes Fyers answer
@@ -520,14 +568,6 @@ class FyersBroker(BaseBroker):
             raise ConnectionError(
                 f"Fyers history request failed: {data.get('message') or data.get('code')}"
             )
-
-        if end_time is not None:
-            candles = [c for c in candles if c.timestamp <= end_time]
-
-        candles.sort(key=lambda c: c.timestamp)
-        if limit and len(candles) > limit:
-            candles = candles[-limit:]
-
         return candles
     
     async def place_order(self, trade: Trade) -> Dict[str, Any]:
