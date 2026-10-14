@@ -54,12 +54,27 @@ def resolution_for(timeframe: str) -> str:
     return RESOLUTION_BY_TIMEFRAME[normalize_timeframe(timeframe)]
 
 
+#: NSE session open (09:15 IST) in minutes after midnight UTC.
+SESSION_OPEN_UTC_MINUTES = 3 * 60 + 45
+
+
+def session_bar_start(ts: datetime, minutes: int) -> datetime:
+    """Open of the ``minutes`` bar containing ``ts`` (naive UTC).
+
+    Bars are counted from the 09:15 IST session open, as the exchange and
+    Fyers history do: 1h bars open at 09:15, 10:15 ... not on the clock hour.
+    For 1/5/15m this equals plain clock flooring (09:15 is a multiple of 15).
+    """
+    day = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed = (ts.hour * 60 + ts.minute) - SESSION_OPEN_UTC_MINUTES
+    return day + timedelta(
+        minutes=SESSION_OPEN_UTC_MINUTES + (elapsed // minutes) * minutes
+    )
+
+
 def align_timestamp(ts: datetime, timeframe: str) -> datetime:
     """Floor a timestamp to the opening boundary of its timeframe bar."""
-    minutes = TIMEFRAME_MINUTES[normalize_timeframe(timeframe)]
-    return ts.replace(
-        minute=(ts.minute // minutes) * minutes, second=0, microsecond=0
-    )
+    return session_bar_start(ts, TIMEFRAME_MINUTES[normalize_timeframe(timeframe)])
 
 
 def is_market_open(now: datetime = None) -> bool:

@@ -105,6 +105,9 @@ def normalize_tick(msg: Any) -> Optional[Dict[str, Any]]:
         "ch": msg.get("ch"),
         "chp": msg.get("chp"),
         "type": msg.get("type"),
+        # Epoch seconds of the trade (equities) or the feed update (indices):
+        # places the tick in the bar the exchange put it in.
+        "exch_time": msg.get("last_traded_time") or msg.get("exch_feed_time"),
     }
 
 

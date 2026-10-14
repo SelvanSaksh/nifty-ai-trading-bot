@@ -43,6 +43,7 @@ class FyersBroker(BaseBroker):
         self._symbols: List[str] = []
         self._session: Optional[asyncio.Task] = None
         self._symbol_prices: Dict[str, float] = {}
+        self._day_volume: Dict[str, int] = {}
     
     async def connect(self) -> bool:
         self.is_connected = True
@@ -89,9 +90,11 @@ class FyersBroker(BaseBroker):
                 volatility = max(price * 0.0002, 0.1)
                 price += random.uniform(-volatility, volatility)
                 self._symbol_prices[sym] = round(price, 2)
+                # Like Fyers' vol_traded_today: cumulative for the day.
+                self._day_volume[sym] = self._day_volume.get(sym, 0) + random.randint(100, 5000)
                 tick = {
                     "ltp": round(price, 2),
-                    "v": random.randint(100, 5000),
+                    "v": self._day_volume[sym],
                     "symbol": sym
                 }
                 
@@ -147,7 +150,7 @@ class FyersBroker(BaseBroker):
         end_time: Optional[datetime] = None,
     ) -> list[Candle]:
         """Generate mock historical candles ending at ``end_time`` (default: now)."""
-        from utils.helpers import timeframe_label
+        from utils.helpers import session_bar_start, timeframe_label
 
         minutes = int(timeframe) if str(timeframe).isdigit() else 15
         label = timeframe_label(minutes)
@@ -160,8 +163,7 @@ class FyersBroker(BaseBroker):
         for i in range(limit):
             # Bars are aligned to their timeframe boundary, like real data.
             ts = end - timedelta(minutes=minutes * (limit - 1 - i))
-            ts = ts.replace(second=0, microsecond=0)
-            ts = ts - timedelta(minutes=ts.minute % minutes)
+            ts = session_bar_start(ts, minutes)
 
             open_p = base_price + random.uniform(-50, 50)
             close = open_p + random.uniform(-30, 30)

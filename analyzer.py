@@ -4,7 +4,7 @@ from datetime import datetime
 from models.candle import Candle
 from models.enums import Direction
 from utils import indicators
-from utils.helpers import timeframe_label
+from utils.helpers import session_bar_start, timeframe_label
 from utils.patterns import detect_candlestick_patterns
 from utils.market_structure import analyze_structure, closed_candles
 from features.options import options_analyzer
@@ -21,6 +21,9 @@ class Analyzer:
     def add_tick(self, price: float, volume: int, timestamp: datetime) -> Optional[Candle]:
         """
         Process incoming tick, build candles for all timeframes.
+
+        ``volume`` is the quantity traded by this tick (not the feed's
+        cumulative day volume - the engine converts that before calling).
 
         A bar's own boundary can never be observed as "closed" from a tick
         that falls inside it — a tick timestamp is always floored to the bar
@@ -74,7 +77,8 @@ class Analyzer:
         self, ts: datetime, price: float, volume: int, minutes: int, candles: List[Candle]
     ) -> Tuple[Candle, Optional[Candle]]:
         """Returns ``(active_candle, sealed_previous_candle_or_None)``."""
-        aligned_ts = ts.replace(minute=(ts.minute // minutes) * minutes, second=0, microsecond=0)
+        # Session-anchored, like the history the buffers are seeded with.
+        aligned_ts = session_bar_start(ts, minutes)
         if not candles or aligned_ts > candles[-1].timestamp:
             sealed = candles[-1] if candles else None
             candle = Candle(

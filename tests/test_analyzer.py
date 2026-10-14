@@ -98,3 +98,48 @@ def test_indicators_computed_from_own_timeframe_series():
     last_15m = sealed_15m[-1]
     assert last_5m.atr != last_15m.atr
     assert last_5m.vwap != last_15m.vwap
+
+
+def test_1h_bars_open_at_the_session_open_not_the_clock_hour():
+    """Fyers 1h bars open at 09:15, 10:15 ... IST (03:45, 04:45 ... UTC);
+    tick-built bars must use the same boundaries or they never line up
+    with the history the buffers are seeded with."""
+    analyzer = Analyzer()
+    start = datetime(2026, 1, 5, 3, 45)  # 09:15 IST
+    _feed_ticks(analyzer, start, [100 + i for i in range(121)], minutes_per_tick=1)
+
+    assert [c.timestamp for c in analyzer.candles_1h] == [
+        datetime(2026, 1, 5, 3, 45),
+        datetime(2026, 1, 5, 4, 45),
+        datetime(2026, 1, 5, 5, 45),
+    ]
+    # A full hour per bar: the 09:15 bar is not cut at 10:00 IST.
+    first = analyzer.candles_1h[0]
+    assert (first.open, first.close) == (100, 159)
+
+
+def test_1h_tick_continues_a_session_aligned_history_bar():
+    from models.candle import Candle
+
+    analyzer = Analyzer()
+    seeded = Candle(timestamp=datetime(2026, 1, 5, 4, 45), open=100, high=101,
+                    low=99, close=100, volume=500, timeframe="1h")
+    analyzer.candles_1h = [seeded]
+    # 10:45 IST: inside the 10:15 bar, past the old (wrong) 10:00 boundary.
+    analyzer.add_tick(105, 7, datetime(2026, 1, 5, 5, 15))
+
+    assert len(analyzer.candles_1h) == 1
+    assert analyzer.candles_1h[0].high == 105
+    assert analyzer.candles_1h[0].volume == 507
+
+
+def test_5m_and_15m_boundaries_are_unchanged():
+    from utils.helpers import session_bar_start
+
+    ts = datetime(2026, 1, 5, 6, 59, 30)
+    assert session_bar_start(ts, 5) == datetime(2026, 1, 5, 6, 55)
+    assert session_bar_start(ts, 15) == datetime(2026, 1, 5, 6, 45)
+    assert session_bar_start(ts, 1) == datetime(2026, 1, 5, 6, 59)
+    assert session_bar_start(ts, 30) == datetime(2026, 1, 5, 6, 45)
+    assert session_bar_start(ts, 60) == datetime(2026, 1, 5, 6, 45)
+    assert session_bar_start(datetime(2026, 1, 5, 6, 44), 60) == datetime(2026, 1, 5, 5, 45)

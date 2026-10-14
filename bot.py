@@ -31,6 +31,7 @@ from config import settings
 from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError, SingletonFileLock
 from utils.market_structure import DEFAULT_STRENGTH, StructureTracker, closed_candles
+from utils.live_bars import LiveBarTracker, in_session
 from utils.helpers import (
     LIVE_TIMEFRAMES,
     TIMEFRAME_MINUTES,
@@ -57,6 +58,8 @@ class NiftyBot:
     HISTORY_LIMIT = 200
     HISTORY_CACHE_TTL = 60.0
     HISTORY_CACHE_MAX_ENTRIES = 32
+    # Exchange time further ahead of the receive time than this is not trusted.
+    EXCHANGE_CLOCK_SKEW = timedelta(seconds=60)
     # How often the engine checks the shared DB for symbol changes made by
     # another process (single writer, shared state).
     RECONCILE_INTERVAL = 5.0
@@ -103,6 +106,10 @@ class NiftyBot:
         self._reconcile_task: Optional[asyncio.Task] = None
         self._pending_symbol_state: Optional[Dict[str, Any]] = None
         self._history_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Forming candles of every subscribed symbol, from its ticks.
+        self.live_bars = LiveBarTracker()
+        # Last cumulative day volume per symbol: (UTC date, volume).
+        self._last_day_volume: Dict[str, Tuple[Any, int]] = {}
         # Market structure per (symbol, timeframe, strength), fed incrementally.
         self._structure_cache: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
         self._structure_locks: Dict[Tuple[str, str, int], asyncio.Lock] = {}
@@ -209,6 +216,7 @@ class NiftyBot:
         # otherwise rebuild the socket at the same moment.
         async with self._lock:
             await refresher()
+            self.live_bars.reset_continuity()
             if self.is_running:
                 self.broker.tick_callback = self._on_tick
                 if self._all_symbols:
@@ -423,7 +431,9 @@ class NiftyBot:
             return
         async with self._lock:
             if self.is_running:
-                await ensure()
+                if await ensure():
+                    # Ticks were missed while the feed was silent.
+                    self.live_bars.reset_continuity()
 
     async def _reconcile_once(self) -> bool:
         if not self.is_running:
@@ -507,9 +517,13 @@ class NiftyBot:
                 entry is not None
                 and entry["expires"] > time.monotonic()
                 and len(entry["candles"]) >= limit
+                and entry["rollover"] == self._open_bar_after(entry["candles"], tf)
             ):
                 return list(entry["candles"])
 
+        # Taken before the request: ticks after this are not in the response.
+        fetched_at = datetime.utcnow()
+        volume_mark = self.live_bars.volume_mark(symbol)
         raw = await self.broker.get_historical_candles(
             symbol=symbol,
             timeframe=RESOLUTION_BY_TIMEFRAME[tf],
@@ -530,12 +544,45 @@ class NiftyBot:
             self._history_cache[key] = {
                 "candles": candles,
                 "expires": time.monotonic() + self.HISTORY_CACHE_TTL,
+                "fetched_at": fetched_at,
+                "volume_mark": volume_mark,
+                # A bar that opens after the newest cached one is fetched for
+                # once; if history does not have it yet, ticks form it meanwhile.
+                "rollover": self._open_bar_after(candles, tf),
             }
             if len(self._history_cache) > self.HISTORY_CACHE_MAX_ENTRIES:
                 oldest = min(self._history_cache, key=lambda k: self._history_cache[k]["expires"])
                 self._history_cache.pop(oldest, None)
 
         return candles
+
+    @staticmethod
+    def _open_bar_after(candles: List[Candle], tf: str) -> Optional[datetime]:
+        """Start of the bar forming now, if it opened after the newest of
+        ``candles`` (during the session only; otherwise None)."""
+        now = datetime.utcnow()
+        if not candles or not in_session(now):
+            return None
+        step = timedelta(minutes=TIMEFRAME_MINUTES[tf])
+        last = candles[-1].timestamp
+        if now < last + step:
+            return None
+        return last + ((now - last) // step) * step
+
+    def _with_live_bar(self, symbol: str, tf: str, candles: List[Candle]) -> List[Candle]:
+        """History of ``symbol`` with its forming bar brought up to date from
+        ticks received since the history was fetched."""
+        entry = self._history_cache.get((symbol, tf))
+        if entry is None or not candles:
+            return candles
+        return self.live_bars.apply(
+            symbol,
+            candles,
+            timedelta(minutes=TIMEFRAME_MINUTES[tf]),
+            entry["fetched_at"],
+            entry["volume_mark"],
+            datetime.utcnow(),
+        )
 
     async def get_candles(
         self,
@@ -585,6 +632,8 @@ class NiftyBot:
             try:
                 fetch_limit = limit if end_dt is not None else max(limit, self.HISTORY_LIMIT)
                 candles = await self._fetch_history(target, tf, fetch_limit, end_time=end_dt)
+                if end_dt is None:
+                    candles = self._with_live_bar(target, tf, candles)
                 source = "history"
             except Exception as exc:
                 error = str(exc)
@@ -781,8 +830,15 @@ class NiftyBot:
         # host's local clock here: that shifts bar boundaries and indicators.
         timestamp = datetime.utcnow()
         
+        # ``v`` is the day's cumulative traded volume, not this tick's.
+        traded = self._traded_since_last_tick(tick_symbol, volume, timestamp)
+
         # Always update watchlist quotes regardless of bot state
         self._update_watchlist_quote(tick_symbol, price, volume, timestamp)
+        # Forming candles of every symbol (history-served series use them).
+        self.live_bars.record(
+            tick_symbol, price, volume, timestamp, self._exchange_time(tick, timestamp)
+        )
         
         # Broadcast watchlist tick to all clients
         quote = self.watchlist_quotes.get(tick_symbol, {})
@@ -803,8 +859,8 @@ class NiftyBot:
         if not self.is_running or tick_symbol != self.symbol:
             return
         
-        # Build candles
-        closed_candle = self.analyzer.add_tick(price, volume, timestamp)
+        # Build candles from the quantity traded since the previous tick.
+        closed_candle = self.analyzer.add_tick(price, traded, timestamp)
         
         # Broadcast live candle to Flutter clients (existing single-symbol chart data)
         await self._broadcast({
@@ -824,6 +880,34 @@ class NiftyBot:
         if closed_candle:
             await self._on_candle_close(closed_candle)
     
+    def _traded_since_last_tick(self, symbol: str, day_volume: Any, at: datetime) -> int:
+        """Quantity traded since ``symbol``'s previous tick, from the day's
+        cumulative volume the feed reports."""
+        day_volume = int(day_volume or 0)
+        previous = self._last_day_volume.get(symbol)
+        self._last_day_volume[symbol] = (at.date(), day_volume)
+        if previous is None:
+            # The current bar comes from history, which already holds the
+            # volume traded so far; only later trades are added.
+            return 0
+        day, last = previous
+        if day != at.date():
+            # First tick of a new session: all of today's volume is new.
+            return day_volume
+        return max(0, day_volume - last)
+
+    @classmethod
+    def _exchange_time(cls, tick: dict, received_at: datetime) -> Optional[datetime]:
+        """The tick's exchange time as naive UTC, or None if absent/implausible."""
+        raw = tick.get("exch_time")
+        try:
+            at = datetime.utcfromtimestamp(int(raw)) if raw else None
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+        if at is None or at > received_at + cls.EXCHANGE_CLOCK_SKEW:
+            return None
+        return at
+
     def _update_watchlist_quote(self, symbol: str, price: float, volume: int, timestamp: datetime):
         """Update the live quote for a symbol in the watchlist."""
         if symbol in self.watchlist_quotes:
