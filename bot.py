@@ -222,6 +222,27 @@ class NiftyBot:
                 if self._all_symbols:
                     await self.broker.subscribe_ticks(self._all_symbols)
                     print(f"[BOT] Resubscribed to {len(self._all_symbols)} symbols after re-login")
+                # While the token was dead no ticks arrived, so the tick-built
+                # buffers miss every bar of the outage (often a whole session).
+                await self._backfill_series("re-login")
+
+    async def _backfill_series(self, reason: str):
+        """Reload the engine's candle buffers from history after a feed gap.
+
+        Caller holds ``self._lock``. A timeframe that fails to load keeps its
+        current buffer: it is still better than none, and the next gap retries.
+        """
+        if self.analyzer_symbol != self.symbol:
+            return
+        try:
+            bundle = await self._fetch_history_bundle(self.symbol)
+        except Exception as exc:
+            print(f"[BOT] Could not backfill candles after {reason}: {exc}")
+            return
+        for tf, attr in (("5m", "candles_5m"), ("15m", "candles_15m"), ("1h", "candles_1h")):
+            if bundle[tf]:
+                setattr(self.analyzer, attr, bundle[tf])
+        print(f"[BOT] Backfilled candles for {self.symbol} after {reason}")
 
     # ── Active symbol ─────────────────────────────────────────────
 
@@ -434,6 +455,7 @@ class NiftyBot:
                 if await ensure():
                     # Ticks were missed while the feed was silent.
                     self.live_bars.reset_continuity()
+                    await self._backfill_series("feed rebuild")
 
     async def _reconcile_once(self) -> bool:
         if not self.is_running:
@@ -860,7 +882,14 @@ class NiftyBot:
             return
         
         # Build candles from the quantity traded since the previous tick.
-        closed_candle = self.analyzer.add_tick(price, traded, timestamp)
+        # Fyers keeps sending index ticks after the close; bars built from
+        # them are flat phantoms that make the series look current while the
+        # real session is missing, so only session ticks form candles.
+        closed_candle = (
+            self.analyzer.add_tick(price, traded, timestamp)
+            if in_session(timestamp)
+            else None
+        )
         
         # Broadcast live candle to Flutter clients (existing single-symbol chart data)
         await self._broadcast({

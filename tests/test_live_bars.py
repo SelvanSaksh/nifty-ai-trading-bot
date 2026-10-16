@@ -302,3 +302,66 @@ class TestEngineTickVolume:
         assert engine._traded_since_last_tick("Y", 0, day) == 0
         # Next session: the counter restarts, all of it is new volume.
         assert engine._traded_since_last_tick("X", 400, day + timedelta(days=1)) == 400
+
+
+class TestEngineSeriesAfterOutage:
+    """After a dead token or a stalled feed the engine's own series must not
+    keep a hole (the chart showed no session at all after a re-login)."""
+
+    @pytest.fixture()
+    async def engine(self, db_path, monkeypatch):
+        import bot as bot_module
+        from database import init_db
+
+        await init_db()
+        engine = bot_module.NiftyBot()
+        engine.is_running = True
+        engine.analyzer_symbol = engine.symbol
+        clock = {"t": BAR}
+
+        class Clock(datetime):
+            @classmethod
+            def utcnow(cls):
+                return clock["t"]
+
+        monkeypatch.setattr(bot_module, "datetime", Clock)
+        return engine, clock
+
+    async def test_after_hours_ticks_form_no_bars(self, engine):
+        engine, clock = engine
+        engine.analyzer.candles_5m = [bar(BAR)]
+        engine.analyzer.candles_15m = []
+        engine.analyzer.candles_1h = []
+        # 21:30 IST - Fyers still streams the index's last price.
+        clock["t"] = datetime(2026, 10, 14, 16, 0, 5)
+        await engine._on_tick({"symbol": engine.symbol, "ltp": 100.0, "v": 0})
+
+        assert [c.timestamp for c in engine.analyzer.candles_5m] == [BAR]
+        assert engine.analyzer.candles_15m == []
+
+    async def test_relogin_backfills_the_missed_session(self, engine, monkeypatch):
+        engine, _ = engine
+        stale = [bar(BAR - FIVE * i) for i in range(5, 0, -1)]
+        engine.analyzer.candles_5m = list(stale)
+        engine.analyzer.candles_15m = [bar(BAR, tf="15m")]
+        engine.analyzer.candles_1h = [bar(BAR, tf="1h")]
+        full = stale + [bar(BAR + FIVE * i) for i in range(4)]
+
+        async def history_stub(symbol, timeframe, limit, end_time=None):
+            if timeframe == "60":
+                raise ConnectionError("Fyers history request failed (HTTP 500)")
+            return list(full)
+
+        async def noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(engine.broker, "get_historical_candles", history_stub)
+        monkeypatch.setattr(engine.broker, "reauthenticate", noop, raising=False)
+        monkeypatch.setattr(engine.broker, "subscribe_ticks", noop)
+
+        await engine.reauthenticate()
+
+        assert [c.timestamp for c in engine.analyzer.candles_5m] == [c.timestamp for c in full]
+        assert len(engine.analyzer.candles_15m) == len(full)
+        # The 1h reload failed: its buffer is kept instead of wiped.
+        assert [c.timeframe for c in engine.analyzer.candles_1h] == ["1h"]
