@@ -4,6 +4,10 @@ from models.signal import Signal
 from models.enums import Direction
 from config import settings
 
+# Names exactly as utils.patterns.detect_candlestick_patterns reports them.
+BULLISH_PATTERNS = ("hammer", "engulfing_bullish", "morning_star", "piercing_pattern")
+BEARISH_PATTERNS = ("shooting_star", "engulfing_bearish", "evening_star", "dark_cloud_cover")
+
 class DecisionEngine:
     """
     Pure-Python rules-based scoring engine.
@@ -111,9 +115,8 @@ class DecisionEngine:
         score += 5  # Placeholder
         
         # Candlestick patterns (max 15)
-        bullish_patterns = ["hammer", "engulfing_bullish", "morning_star", "piercing"]
         for p in patterns:
-            if p in bullish_patterns:
+            if p in BULLISH_PATTERNS:
                 score += 15
                 break
         
@@ -163,9 +166,8 @@ class DecisionEngine:
         score += 5
         
         # Patterns (max 15)
-        bearish_patterns = ["shooting_star", "engulfing_bearish", "evening_star", "dark_cloud"]
         for p in patterns:
-            if p in bearish_patterns:
+            if p in BEARISH_PATTERNS:
                 score += 15
                 break
         
