@@ -105,16 +105,30 @@ class Analyzer:
         candle.adx = indicators.adx(series)
         candle.bb_upper, candle.bb_lower = indicators.bollinger_bands(closes)
     
+    def _series_through(self, candle: Candle) -> List[Candle]:
+        """15m candles up to and including ``candle``.
+
+        A bar closes on the first tick of the next one, so when ``analyze``
+        runs the newest 15m candle is that one-tick bar. Patterns and the
+        advanced detectors read the *last* candle of their series, which must
+        be the closed one (a one-tick bar has no body or range at all).
+        """
+        for i in range(len(self.candles_15m) - 1, -1, -1):
+            if self.candles_15m[i] is candle:
+                return self.candles_15m[: i + 1]
+        return self.candles_15m
+
     async def analyze(self, candle: Candle) -> Dict[str, Any]:
         """Return complete analysis for decision engine."""
-        closes = [c.close for c in self.candles_15m]
-        patterns = detect_candlestick_patterns(self.candles_15m)
+        series = self._series_through(candle)
+        closes = [c.close for c in series]
+        patterns = detect_candlestick_patterns(series)
         
         # Advanced signals
-        divergence = self._detect_rsi_divergence()
-        fvg = self._detect_fair_value_gap()
-        liquidity_sweep = self._detect_liquidity_sweep()
-        order_block = self._detect_order_block()
+        divergence = self._detect_rsi_divergence(series)
+        fvg = self._detect_fair_value_gap(series)
+        liquidity_sweep = self._detect_liquidity_sweep(series)
+        order_block = self._detect_order_block(series)
         
         # Market context
         market_context = await self._get_market_context()
@@ -137,13 +151,14 @@ class Analyzer:
             "higher_timeframe_trend": self._higher_timeframe_filter()
         }
     
-    def _detect_rsi_divergence(self) -> Optional[str]:
+    def _detect_rsi_divergence(self, series: Optional[List[Candle]] = None) -> Optional[str]:
         """Bullish/bearish RSI divergence."""
-        if len(self.candles_15m) < 20:
+        candles = self.candles_15m if series is None else series
+        if len(candles) < 20:
             return None
         
         # Simplified: check last 5 candles for price/RSI divergence
-        recent = self.candles_15m[-5:]
+        recent = candles[-5:]
         price_making_lower_lows = all(recent[i].low < recent[i-1].low for i in range(1, len(recent)))
         rsi_values = [c.rsi for c in recent if c.rsi is not None]
         
@@ -154,12 +169,13 @@ class Analyzer:
         
         return None
     
-    def _detect_fair_value_gap(self) -> Optional[Dict]:
+    def _detect_fair_value_gap(self, series: Optional[List[Candle]] = None) -> Optional[Dict]:
         """Detect Fair Value Gap (FVG) in recent candles."""
-        if len(self.candles_15m) < 3:
+        candles = self.candles_15m if series is None else series
+        if len(candles) < 3:
             return None
         
-        c1, _mid, c3 = self.candles_15m[-3], self.candles_15m[-2], self.candles_15m[-1]
+        c1, _mid, c3 = candles[-3], candles[-2], candles[-1]
         
         # Bullish FVG: c1.high < c3.low
         if c1.high < c3.low:
@@ -170,14 +186,15 @@ class Analyzer:
         
         return None
     
-    def _detect_liquidity_sweep(self) -> Optional[str]:
+    def _detect_liquidity_sweep(self, series: Optional[List[Candle]] = None) -> Optional[str]:
         """Detect liquidity sweep above/below recent highs/lows."""
-        if len(self.candles_15m) < 10:
+        candles = self.candles_15m if series is None else series
+        if len(candles) < 10:
             return None
         
-        recent_high = max(c.high for c in self.candles_15m[-10:-1])
-        recent_low = min(c.low for c in self.candles_15m[-10:-1])
-        current = self.candles_15m[-1]
+        recent_high = max(c.high for c in candles[-10:-1])
+        recent_low = min(c.low for c in candles[-10:-1])
+        current = candles[-1]
         
         if current.high > recent_high and current.close < recent_high:
             return "sweep_high"
@@ -186,12 +203,13 @@ class Analyzer:
         
         return None
     
-    def _detect_order_block(self) -> Optional[Dict]:
+    def _detect_order_block(self, series: Optional[List[Candle]] = None) -> Optional[Dict]:
         """Detect bullish/bearish order block."""
-        if len(self.candles_15m) < 3:
+        candles = self.candles_15m if series is None else series
+        if len(candles) < 3:
             return None
         
-        c1, c2, _last = self.candles_15m[-3], self.candles_15m[-2], self.candles_15m[-1]
+        c1, c2, _last = candles[-3], candles[-2], candles[-1]
         
         # Bullish OB: strong bearish candle followed by strong bullish
         if c1.close < c1.open and c2.close > c2.open and c2.close > c1.open:

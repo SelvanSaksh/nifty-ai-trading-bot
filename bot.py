@@ -12,6 +12,7 @@ from brokers.base import ORDER_CANCELLED, ORDER_FILLED, ORDER_FINAL, ORDER_REJEC
 from brokers.fyers_broker import FyersBroker
 from brokers.fyers_broker_mock import FyersBroker as MockFyersBroker
 
+import trade_rules
 from analyzer import Analyzer
 from decision_engine import DecisionEngine
 from risk_manager import RiskManager
@@ -35,7 +36,6 @@ from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError, SingletonFileLock
 from utils.market_structure import DEFAULT_STRENGTH, StructureTracker, closed_candles
 from utils.live_bars import LiveBarTracker, in_session
-from utils.market_time import parse_hhmm, to_ist
 from utils.helpers import (
     LIVE_TIMEFRAMES,
     TIMEFRAME_MINUTES,
@@ -1287,61 +1287,20 @@ class NiftyBot:
                 return None
         return filled, fill_price or price, False
 
-    def _square_off_due(self, trade: Trade, now_utc: datetime) -> bool:
-        """At/after the square-off time, or the trade is from an earlier day."""
-        now = to_ist(now_utc)
-        return (
-            now.time() >= parse_hhmm(settings.SQUARE_OFF_TIME)
-            or to_ist(trade.entry_time).date() < now.date()
-        )
-
     async def _manage_trade(self, current_price: float, timestamp: datetime):
-        """Manage open position — square-off, stop loss and targets."""
+        """Manage open position — square-off, stop loss and targets
+        (the rules live in trade_rules, shared with the backtester)."""
         async with self._trade_lock:
             trade = self.active_trade
             if trade is None or self._trade_frozen or time.monotonic() < self._exit_retry_at:
                 return
-
-            if self._square_off_due(trade, timestamp):
-                await self._exit_trade(current_price, timestamp, "EOD_SQUARE_OFF")
+            action = trade_rules.next_exit(trade, current_price, timestamp)
+            if action is None:
                 return
-
-            # Check stop loss first (highest priority)
-            sl_hit = (
-                (trade.direction == Direction.LONG and current_price <= trade.stop_loss) or
-                (trade.direction == Direction.SHORT and current_price >= trade.stop_loss)
-            )
-
-            if sl_hit:
-                # Booked at the price that crossed the stop: a stop is a
-                # market exit once triggered, and gaps fill beyond it.
-                await self._exit_trade(current_price, timestamp, "STOP_LOSS")
-                return
-
-            # Check targets
-            if trade.status == TradeStatus.OPEN:
-                t1_hit = (
-                    (trade.direction == Direction.LONG and current_price >= trade.target_1) or
-                    (trade.direction == Direction.SHORT and current_price <= trade.target_1)
-                )
-                if t1_hit:
-                    await self._partial_exit(trade.target_1, timestamp, TradeStatus.PARTIAL_1, 0.5)
-
-            elif trade.status == TradeStatus.PARTIAL_1:
-                t2_hit = (
-                    (trade.direction == Direction.LONG and current_price >= trade.target_2) or
-                    (trade.direction == Direction.SHORT and current_price <= trade.target_2)
-                )
-                if t2_hit:
-                    await self._partial_exit(trade.target_2, timestamp, TradeStatus.PARTIAL_2, 0.375)
-
-            elif trade.status == TradeStatus.PARTIAL_2:
-                t3_hit = (
-                    (trade.direction == Direction.LONG and current_price >= trade.target_3) or
-                    (trade.direction == Direction.SHORT and current_price <= trade.target_3)
-                )
-                if t3_hit:
-                    await self._exit_trade(trade.target_3, timestamp, "TARGET_3")
+            if action.fraction is None:
+                await self._exit_trade(action.price, timestamp, action.reason)
+            else:
+                await self._partial_exit(action.price, timestamp, action.new_status, action.fraction)
 
     async def _supervise_trade(self):
         """Checks that must not wait for a tick (the feed can fall silent):
@@ -1353,7 +1312,7 @@ class NiftyBot:
             if trade is None or self._trade_frozen or time.monotonic() < self._exit_retry_at:
                 return
             now = datetime.utcnow()
-            if self._square_off_due(trade, now):
+            if trade_rules.square_off_due(trade, now):
                 # A paper trade needs a real price; a live one is filled by the broker.
                 price = self._last_price or (None if trade.paper_trade else trade.entry_price)
                 if price is not None:
@@ -1386,9 +1345,9 @@ class NiftyBot:
         """Execute partial exit at target (in whole lots)."""
         trade = self.active_trade
         label = "T1" if new_status == TradeStatus.PARTIAL_1 else "T2"
-        lot = self.risk_manager.lot_size_for(trade.symbol)
-        exit_qty = int(trade.initial_qty * fraction) // lot * lot
-        exit_qty = min(exit_qty, trade.remaining_qty)
+        exit_qty = trade_rules.partial_qty(
+            trade, fraction, self.risk_manager.lot_size_for(trade.symbol)
+        )
 
         if exit_qty <= 0:
             # Too small to split: the whole position rides to the next target.
