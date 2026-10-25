@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     # ── Trading Session (IST) ───────────────────────────────────
     TRADING_START_TIME: str = "09:15"
     TRADING_END_TIME: str = "15:30"
+    # An open intraday trade is closed at this time, and no new trade opens
+    # from then on. Fyers squares INTRADAY positions off itself around 15:20
+    # and charges for it.
+    SQUARE_OFF_TIME: str = "15:15"
+    # Quantity step for instruments without their own lot: index paper
+    # trades simulate futures in lots of this size. Set it to the current
+    # exchange lot. Equities (-EQ) always trade in single shares.
+    LOT_SIZE: int = 50
     
     # ── Server ──────────────────────────────────────────────────
     HOST: str = "0.0.0.0"

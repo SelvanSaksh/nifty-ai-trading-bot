@@ -303,6 +303,60 @@ class TestEngineTickVolume:
         # Next session: the counter restarts, all of it is new volume.
         assert engine._traded_since_last_tick("X", 400, day + timedelta(days=1)) == 400
 
+    async def test_exchange_time_stamps_and_places_the_tick(self, engine, monkeypatch):
+        import bot as bot_module
+
+        # Traded 1s before the bar boundary, received just after it.
+        traded = BAR + FIVE - timedelta(seconds=1)
+        received = BAR + FIVE + timedelta(milliseconds=300)
+
+        class Clock(datetime):
+            @classmethod
+            def utcnow(cls):
+                return received
+
+        monkeypatch.setattr(bot_module, "datetime", Clock)
+        sent = []
+
+        async def capture(data):
+            sent.append(data)
+
+        monkeypatch.setattr(engine, "_broadcast", capture)
+        engine.analyzer.candles_5m = [bar(BAR)]
+        engine.analyzer.candles_15m = []
+        engine.analyzer.candles_1h = []
+        epoch = int((traded - datetime(1970, 1, 1)).total_seconds())
+        await engine._on_tick(
+            {"symbol": engine.symbol, "ltp": 123.0, "v": 0, "exch_time": epoch}
+        )
+
+        assert [c.timestamp for c in engine.analyzer.candles_5m] == [BAR]
+        assert engine.analyzer.candles_5m[-1].close == 123.0
+        stamps = {m["type"]: m["timestamp"] for m in sent}
+        assert stamps["watchlist_tick"] == traded.isoformat()
+        assert stamps["tick"] == traded.isoformat()
+
+    async def test_receive_time_is_the_fallback(self, engine, monkeypatch):
+        import bot as bot_module
+
+        received = BAR + timedelta(seconds=40)
+
+        class Clock(datetime):
+            @classmethod
+            def utcnow(cls):
+                return received
+
+        monkeypatch.setattr(bot_module, "datetime", Clock)
+        sent = []
+
+        async def capture(data):
+            sent.append(data)
+
+        monkeypatch.setattr(engine, "_broadcast", capture)
+        await engine._on_tick({"symbol": engine.symbol, "ltp": 123.0, "v": 0})
+
+        assert sent[0]["timestamp"] == received.isoformat()
+
 
 class TestEngineSeriesAfterOutage:
     """After a dead token or a stalled feed the engine's own series must not

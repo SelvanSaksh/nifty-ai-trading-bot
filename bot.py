@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import WebSocket
+from fastapi.encoders import jsonable_encoder
 
+from brokers.base import ORDER_CANCELLED, ORDER_FILLED, ORDER_FINAL, ORDER_REJECTED
 from brokers.fyers_broker import FyersBroker
 from brokers.fyers_broker_mock import FyersBroker as MockFyersBroker
 
@@ -17,6 +19,7 @@ from database import (
     save_candle,
     save_signal,
     save_trade,
+    get_open_trade,
     get_recent_trades,
     get_recent_signals,
     get_active_symbol_state,
@@ -32,11 +35,13 @@ from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError, SingletonFileLock
 from utils.market_structure import DEFAULT_STRENGTH, StructureTracker, closed_candles
 from utils.live_bars import LiveBarTracker, in_session
+from utils.market_time import parse_hhmm, to_ist
 from utils.helpers import (
     LIVE_TIMEFRAMES,
     TIMEFRAME_MINUTES,
     RESOLUTION_BY_TIMEFRAME,
     normalize_timeframe,
+    round_to_tick,
 )
 
 # EXCHANGE:CODE, e.g. NSE:NIFTY50-INDEX or NSE:INFY-EQ
@@ -67,6 +72,11 @@ class NiftyBot:
     # how many series stay in memory.
     STRUCTURE_REFRESH_SECONDS = 5.0
     STRUCTURE_MAX_SERIES = 24
+    # A market order still open after this many polls is cancelled.
+    ORDER_FILL_POLLS = 10
+    ORDER_FILL_POLL_SECONDS = 0.5
+    # Pause before an exit that did not go through is tried again.
+    EXIT_RETRY_SECONDS = 10.0
 
     def __init__(self):
         mode = settings.BROKER_MODE.strip().lower()
@@ -84,7 +94,19 @@ class NiftyBot:
         self.is_running = False
         self.start_time: Optional[datetime] = None
         self.active_trade: Optional[Trade] = None
-        self.today_pnl = 0.0
+        # Serializes every change to the open position. Ticks are handled
+        # concurrently, and two handlers that both see the stop hit must not
+        # both send an exit order.
+        self._trade_lock = asyncio.Lock()
+        # Why new trades are blocked (e.g. the broker position did not match
+        # the bot's records), or None. Cleared by the next start.
+        self.trading_halted: Optional[str] = None
+        # The open trade's broker state is unknown: the bot stops touching it
+        # until a restart reconciles it with the broker.
+        self._trade_frozen = False
+        self._exit_retry_at = 0.0  # time.monotonic()
+        # Last traded price of the active symbol.
+        self._last_price: Optional[float] = None
 
         self.symbol: str = settings.TRADING_SYMBOL
         self.symbol_name: str = settings.TRADING_SYMBOL_NAME
@@ -117,6 +139,11 @@ class NiftyBot:
         # Multi-symbol watchlist live quotes: {symbol: {ltp, change, change_pct, open, high, low, volume, name, instrument_type}}
         self.watchlist_quotes: Dict[str, Dict[str, Any]] = {}
         self._all_symbols: List[str] = []
+
+    @property
+    def today_pnl(self) -> float:
+        """Realized P&L of the current IST trading day (closed trades)."""
+        return self.risk_manager.daily_pnl
 
     @property
     def uptime(self) -> str:
@@ -153,6 +180,10 @@ class NiftyBot:
             # history for *that* symbol.
             await self._sync_symbol_from_state()
             await self._load_history_for(self.symbol)
+            # Limits and any trade left open survive restarts; the trade is
+            # checked against the broker before anything new is allowed.
+            await self.risk_manager.load()
+            await self._restore_open_trade()
 
             self.broker.tick_callback = self._on_tick
 
@@ -193,13 +224,16 @@ class NiftyBot:
 
         self.is_running = False
 
+        # Close the position while the broker session is still up (and
+        # before another engine could take over and restore the trade).
+        if self.active_trade:
+            await self._emergency_exit("Bot stopped")
+
         if self.engine_leader:
             self._engine_lock.release()
             self.engine_leader = False
 
         await self.broker.disconnect()
-        if self.active_trade:
-            await self._emergency_exit("Bot stopped")
         await self.notifier.send(f"🛑 {self.symbol_name} AI Bot stopped")
 
     async def reauthenticate(self):
@@ -444,6 +478,12 @@ class NiftyBot:
                 raise
             except Exception as exc:
                 print(f"[BOT] Live feed check failed: {exc}")
+            try:
+                await self._supervise_trade()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[BOT] Trade check failed: {exc}")
 
     async def _watch_live_feed(self):
         """Rebuild the broker's tick socket if it went silent in market hours."""
@@ -850,17 +890,19 @@ class NiftyBot:
         volume = tick.get("v", 0)
         # Candles are stored as naïve UTC by API contract. Never use the
         # host's local clock here: that shifts bar boundaries and indicators.
-        timestamp = datetime.utcnow()
+        received_at = datetime.utcnow()
+        # The trade's own exchange time places it in its bar, as other charts
+        # do; the receive time is only a fallback (missing/implausible value).
+        exchange_at = self._exchange_time(tick, received_at)
+        timestamp = exchange_at or received_at
         
         # ``v`` is the day's cumulative traded volume, not this tick's.
-        traded = self._traded_since_last_tick(tick_symbol, volume, timestamp)
+        traded = self._traded_since_last_tick(tick_symbol, volume, received_at)
 
         # Always update watchlist quotes regardless of bot state
         self._update_watchlist_quote(tick_symbol, price, volume, timestamp)
         # Forming candles of every symbol (history-served series use them).
-        self.live_bars.record(
-            tick_symbol, price, volume, timestamp, self._exchange_time(tick, timestamp)
-        )
+        self.live_bars.record(tick_symbol, price, volume, received_at, exchange_at)
         
         # Broadcast watchlist tick to all clients
         quote = self.watchlist_quotes.get(tick_symbol, {})
@@ -880,6 +922,7 @@ class NiftyBot:
         # Only process candle building / trade logic for the active trading symbol when running
         if not self.is_running or tick_symbol != self.symbol:
             return
+        self._last_price = price
         
         # Build candles from the quantity traded since the previous tick.
         # Fyers keeps sending index ticks after the close; bars built from
@@ -967,7 +1010,7 @@ class NiftyBot:
         """Full decision cycle on closed candle."""
         # Save candle to DB
         await save_candle(candle, self.symbol)
-        
+
         # Check if trading allowed — NOW WITH await
         can_trade, reason = await self.risk_manager.can_trade()
         if not can_trade:
@@ -977,7 +1020,7 @@ class NiftyBot:
                 "timestamp": datetime.now().isoformat()
             })
             return
-        
+
         # Run analysis
         analysis = await self.analyzer.analyze(candle)
         # Use the same structure the chart shows (every candle since
@@ -988,63 +1031,101 @@ class NiftyBot:
                 analysis["market_structure"] = shared["summary"]
         except Exception as exc:
             print(f"[BOT] Market structure unavailable: {exc}")
-        
+
         # Decision engine
         signal = self.decision_engine.evaluate(analysis)
         signal.symbol = self.symbol
         signal.symbol_name = self.symbol_name
-        
+
         # Save signal
         await save_signal(signal, self.symbol, self.symbol_name)
         await self._broadcast({
             "type": "signal",
             "signal": signal.model_dump()
         })
-        
+
         # Validate and enter if passes
         valid, validation_reason = self.risk_manager.validate_signal(signal)
         if valid and signal.direction != Direction.WAIT:
-            await self._enter_trade(signal, candle.close)
-        else:
-            await self._broadcast({
-                "type": "wait",
-                "reason": validation_reason,
-                "signal_score": signal.score
-            })
-    
-    async def _enter_trade(self, signal: Signal, entry_price: float):
-        """Enter a new trade."""
-        qty = self.risk_manager.calculate_position_size(signal, entry_price)
-        if qty <= 0:
-            return
-        
-        trade = Trade(
-            entry_time=datetime.now(),
-            direction=signal.direction,
-            entry_price=entry_price,
-            quantity=qty,
-            initial_qty=qty,
-            remaining_qty=qty,
-            stop_loss=signal.stop_loss,
-            target_1=signal.target_1,
-            target_2=signal.target_2,
-            target_3=signal.target_3,
-            symbol=self.symbol,
-            symbol_name=self.symbol_name,
-            signal_score=signal.score,
-            confidence=signal.confidence,
-            paper_trade=settings.PAPER_TRADING
-        )
-        
-        # Place order
-        order_result = await self.broker.place_order(trade)
-        
-        if order_result.get("s") == "ok":
+            validation_reason = await self._enter_trade(signal, candle.close)
+            if validation_reason is None:
+                return
+        await self._broadcast({
+            "type": "wait",
+            "reason": validation_reason,
+            "signal_score": signal.score
+        })
+
+    # ── Trades ────────────────────────────────────────────────────
+    #
+    # Paper trades never reach the broker. A live trade is an intraday
+    # market entry plus a stop-loss market (SL-M) order resting at the
+    # broker for the open quantity, so the position stays protected even if
+    # this process dies. Every exit goes to the broker, and the bot only
+    # books what the broker confirms as filled.
+    #
+    # Methods below the public entry points (_enter_trade, _manage_trade,
+    # _supervise_trade, _emergency_exit) expect the caller to hold
+    # ``self._trade_lock``.
+
+    @staticmethod
+    def _entry_side(trade: Trade) -> int:
+        return 1 if trade.direction == Direction.LONG else -1
+
+    @classmethod
+    def _exit_side(cls, trade: Trade) -> int:
+        return -cls._entry_side(trade)
+
+    async def _enter_trade(self, signal: Signal, entry_price: float) -> Optional[str]:
+        """Enter a new trade. Returns why it was not entered, or None."""
+        async with self._trade_lock:
+            # One position at a time: a second entry would leave the first
+            # one untracked (no stop, no exit).
+            if self.active_trade is not None:
+                return f"Trade {self.active_trade.id} is already open"
+            if self.trading_halted:
+                return f"New trades blocked: {self.trading_halted}"
+            paper = settings.PAPER_TRADING
+            if not paper and not self.symbol.endswith("-EQ"):
+                return (
+                    f"{self.symbol} cannot be traded live: only NSE equities (-EQ) "
+                    "are supported; an index has no orders"
+                )
+
+            lot = self.risk_manager.lot_size_for(self.symbol)
+            qty = self.risk_manager.calculate_position_size(signal, entry_price, lot)
+            if qty <= 0:
+                return "Position size 0: one lot would risk more than the per-trade limit"
+
+            trade = Trade(
+                # Naive UTC, like every time the API serves.
+                entry_time=datetime.utcnow(),
+                direction=signal.direction,
+                entry_price=entry_price,
+                quantity=qty,
+                initial_qty=qty,
+                remaining_qty=qty,
+                # On the exchange price step, so the bot and the broker stop
+                # trigger at the same price.
+                stop_loss=round_to_tick(signal.stop_loss),
+                target_1=signal.target_1,
+                target_2=signal.target_2,
+                target_3=signal.target_3,
+                symbol=self.symbol,
+                symbol_name=self.symbol_name,
+                signal_score=signal.score,
+                confidence=signal.confidence,
+                paper_trade=paper
+            )
+
+            if not paper and not await self._open_live_position(trade):
+                return "Entry order did not fill (see alerts)"
+
             self.active_trade = trade
             await save_trade(trade)
-            
+
             msg = (
-                f"📊 {'PAPER' if settings.PAPER_TRADING else 'LIVE'} TRADE ENTERED\n"
+                f"📊 {'PAPER' if paper else 'LIVE'} TRADE ENTERED\n"
                 f"Symbol: {trade.symbol_name} ({trade.symbol})\n"
                 f"Direction: {trade.direction.value}\n"
                 f"Entry: {trade.entry_price}\n"
@@ -1055,88 +1136,333 @@ class NiftyBot:
             )
             await self.notifier.send(msg)
             await self._broadcast({"type": "trade_entered", "trade": trade.model_dump()})
-    
-    async def _manage_trade(self, current_price: float, timestamp: datetime):
-        """Manage open position — stop loss and targets."""
-        if not self.active_trade:
-            return
-        
-        trade = self.active_trade
-        
-        # Check stop loss first (highest priority)
-        sl_hit = (
-            (trade.direction == Direction.LONG and current_price <= trade.stop_loss) or
-            (trade.direction == Direction.SHORT and current_price >= trade.stop_loss)
+
+            if not paper and trade.sl_order_id is None:
+                # Never hold a position the broker is not protecting.
+                await self.notifier.send(
+                    f"🚨 The broker refused the stop-loss of {trade.id} — closing the position"
+                )
+                await self._exit_trade(trade.entry_price, datetime.utcnow(), "STOP_ORDER_FAILED")
+            return None
+
+    async def _open_live_position(self, trade: Trade) -> bool:
+        """Send the entry and its broker stop. False if no position opened."""
+        result = await self._market_fill(trade.symbol, self._entry_side(trade), trade.quantity, trade)
+        if result is None:
+            await self._freeze(f"the entry order of {trade.id} is in an unknown state")
+            return False
+        filled, price = result
+        if filled <= 0:
+            await self.notifier.send(f"⚠️ Entry order for {trade.symbol} did not fill; no trade opened")
+            return False
+        trade.quantity = trade.initial_qty = trade.remaining_qty = filled
+        if price:
+            trade.entry_price = price
+        await self._place_stop(trade, filled)
+        return True
+
+    async def _market_fill(
+        self, symbol: str, side: int, qty: int, trade: Optional[Trade] = None
+    ) -> Optional[Tuple[int, Optional[float]]]:
+        """Market order, waited on until it is filled or finished.
+
+        Returns (filled quantity, average price); (0, None) when the broker
+        refused it; None when its state could not be learned (it may or may
+        not have filled).
+        """
+        reply = await self.broker.place_market_order(symbol, side, qty)
+        order_id = str(reply.get("id") or "")
+        if reply.get("s") != "ok" or not order_id:
+            await self.notifier.send(f"⚠️ Order for {qty} {symbol} refused: {reply.get('message')}")
+            return 0, None
+        if trade is not None and trade.entry_order_id is None:
+            trade.entry_order_id = order_id
+        return await self._await_fill(order_id, qty)
+
+    async def _await_fill(self, order_id: str, qty: int) -> Optional[Tuple[int, Optional[float]]]:
+        order = None
+        for _ in range(self.ORDER_FILL_POLLS):
+            order = await self.broker.get_order(order_id)
+            if order is not None and order["status"] in ORDER_FINAL:
+                break
+            await asyncio.sleep(self.ORDER_FILL_POLL_SECONDS)
+        else:
+            # Still working: cancel what is left, then read what did fill
+            # (a fill can land just before the cancel).
+            await self.broker.cancel_order(order_id)
+            order = await self.broker.get_order(order_id)
+        if order is None or order["status"] not in ORDER_FINAL:
+            return None
+        filled = order["filled_qty"]
+        if order["status"] == ORDER_FILLED and filled <= 0:
+            filled = qty
+        return filled, order["price"]
+
+    async def _place_stop(self, trade: Trade, qty: int) -> bool:
+        """Rest a stop-loss order at the broker for ``qty`` of ``trade``."""
+        reply = await self.broker.place_stop_order(
+            trade.symbol, self._exit_side(trade), qty, trade.stop_loss
         )
-        
-        if sl_hit:
-            await self._exit_trade(trade.stop_loss, timestamp, "STOP_LOSS")
+        order_id = str(reply.get("id") or "")
+        trade.sl_order_id = None
+        if reply.get("s") != "ok" or not order_id:
+            print(f"[BOT] Stop order for {trade.id} refused: {reply.get('message')}")
+            return False
+        # Accepted orders can still be rejected by the exchange a moment later.
+        order = await self.broker.get_order(order_id)
+        if order is not None and order["status"] in (ORDER_CANCELLED, ORDER_REJECTED):
+            print(f"[BOT] Stop order for {trade.id} {order['status'].lower()}: {order['message']}")
+            return False
+        trade.sl_order_id = order_id
+        return True
+
+    async def _protect(self, trade: Trade, open_qty: int):
+        """Make the broker stop cover exactly ``open_qty`` again."""
+        if open_qty <= 0:
             return
-        
-        # Check targets
-        if trade.status == TradeStatus.OPEN:
-            t1_hit = (
-                (trade.direction == Direction.LONG and current_price >= trade.target_1) or
-                (trade.direction == Direction.SHORT and current_price <= trade.target_1)
+        if trade.sl_order_id:
+            ok = await self.broker.modify_order(
+                trade.sl_order_id, qty=open_qty, type=3, stopPrice=trade.stop_loss
             )
-            if t1_hit:
-                await self._partial_exit(trade.target_1, timestamp, TradeStatus.PARTIAL_1, 0.5)
-        
-        elif trade.status == TradeStatus.PARTIAL_1:
-            t2_hit = (
-                (trade.direction == Direction.LONG and current_price >= trade.target_2) or
-                (trade.direction == Direction.SHORT and current_price <= trade.target_2)
+        else:
+            ok = await self._place_stop(trade, open_qty)
+        if not ok:
+            await self.notifier.send(
+                f"🚨 {trade.id}: {open_qty} {trade.symbol} open with NO broker stop-loss"
             )
-            if t2_hit:
-                await self._partial_exit(trade.target_2, timestamp, TradeStatus.PARTIAL_2, 0.375)
-        
-        elif trade.status == TradeStatus.PARTIAL_2:
-            t3_hit = (
-                (trade.direction == Direction.LONG and current_price >= trade.target_3) or
-                (trade.direction == Direction.SHORT and current_price <= trade.target_3)
+
+    async def _broker_stop_fill(self, trade: Trade) -> Optional[float]:
+        """Fill price if the broker's stop already closed the position."""
+        if trade.paper_trade or not trade.sl_order_id:
+            return None
+        order = await self.broker.get_order(trade.sl_order_id)
+        if order is None or order["status"] != ORDER_FILLED:
+            return None
+        return order["price"] or trade.stop_loss
+
+    async def _execute_exit(
+        self, trade: Trade, qty: int, price: float
+    ) -> Optional[Tuple[int, float, bool]]:
+        """Take ``qty`` off the open position.
+
+        Returns (quantity closed, fill price, closed by the broker stop), or
+        None when nothing was closed (the position is unchanged; retry later).
+        """
+        if trade.paper_trade:
+            return qty, price, False
+
+        stop_fill = await self._broker_stop_fill(trade)
+        if stop_fill is not None:
+            return trade.remaining_qty, stop_fill, True
+
+        keep = trade.remaining_qty - qty
+        # Shrink the broker stop to what stays open *before* selling: a stop
+        # bigger than the position would open a reverse position if it fired.
+        if trade.sl_order_id:
+            if keep > 0:
+                adjusted = await self.broker.modify_order(
+                    trade.sl_order_id, qty=keep, type=3, stopPrice=trade.stop_loss
+                )
+            else:
+                adjusted = await self.broker.cancel_order(trade.sl_order_id)
+            if not adjusted:
+                # Most likely the stop fired a moment ago.
+                stop_fill = await self._broker_stop_fill(trade)
+                if stop_fill is not None:
+                    return trade.remaining_qty, stop_fill, True
+                await self.notifier.send(f"⚠️ Could not adjust the stop of {trade.id}; exit postponed")
+                return None
+            if keep == 0:
+                trade.sl_order_id = None
+
+        result = await self._market_fill(trade.symbol, self._exit_side(trade), qty)
+        if result is None:
+            await self._freeze(f"an exit order of {trade.id} is in an unknown state")
+            return None
+        filled, fill_price = result
+        if filled < qty:
+            await self._protect(trade, trade.remaining_qty - filled)
+            if filled <= 0:
+                await self.notifier.send(f"⚠️ Exit order for {trade.id} did not fill; will retry")
+                return None
+        return filled, fill_price or price, False
+
+    def _square_off_due(self, trade: Trade, now_utc: datetime) -> bool:
+        """At/after the square-off time, or the trade is from an earlier day."""
+        now = to_ist(now_utc)
+        return (
+            now.time() >= parse_hhmm(settings.SQUARE_OFF_TIME)
+            or to_ist(trade.entry_time).date() < now.date()
+        )
+
+    async def _manage_trade(self, current_price: float, timestamp: datetime):
+        """Manage open position — square-off, stop loss and targets."""
+        async with self._trade_lock:
+            trade = self.active_trade
+            if trade is None or self._trade_frozen or time.monotonic() < self._exit_retry_at:
+                return
+
+            if self._square_off_due(trade, timestamp):
+                await self._exit_trade(current_price, timestamp, "EOD_SQUARE_OFF")
+                return
+
+            # Check stop loss first (highest priority)
+            sl_hit = (
+                (trade.direction == Direction.LONG and current_price <= trade.stop_loss) or
+                (trade.direction == Direction.SHORT and current_price >= trade.stop_loss)
             )
-            if t3_hit:
-                await self._exit_trade(trade.target_3, timestamp, "TARGET_3")
-    
+
+            if sl_hit:
+                # Booked at the price that crossed the stop: a stop is a
+                # market exit once triggered, and gaps fill beyond it.
+                await self._exit_trade(current_price, timestamp, "STOP_LOSS")
+                return
+
+            # Check targets
+            if trade.status == TradeStatus.OPEN:
+                t1_hit = (
+                    (trade.direction == Direction.LONG and current_price >= trade.target_1) or
+                    (trade.direction == Direction.SHORT and current_price <= trade.target_1)
+                )
+                if t1_hit:
+                    await self._partial_exit(trade.target_1, timestamp, TradeStatus.PARTIAL_1, 0.5)
+
+            elif trade.status == TradeStatus.PARTIAL_1:
+                t2_hit = (
+                    (trade.direction == Direction.LONG and current_price >= trade.target_2) or
+                    (trade.direction == Direction.SHORT and current_price <= trade.target_2)
+                )
+                if t2_hit:
+                    await self._partial_exit(trade.target_2, timestamp, TradeStatus.PARTIAL_2, 0.375)
+
+            elif trade.status == TradeStatus.PARTIAL_2:
+                t3_hit = (
+                    (trade.direction == Direction.LONG and current_price >= trade.target_3) or
+                    (trade.direction == Direction.SHORT and current_price <= trade.target_3)
+                )
+                if t3_hit:
+                    await self._exit_trade(trade.target_3, timestamp, "TARGET_3")
+
+    async def _supervise_trade(self):
+        """Checks that must not wait for a tick (the feed can fall silent):
+        the square-off, and that the broker stop is still in place."""
+        if self.active_trade is None:
+            return
+        async with self._trade_lock:
+            trade = self.active_trade
+            if trade is None or self._trade_frozen or time.monotonic() < self._exit_retry_at:
+                return
+            now = datetime.utcnow()
+            if self._square_off_due(trade, now):
+                # A paper trade needs a real price; a live one is filled by the broker.
+                price = self._last_price or (None if trade.paper_trade else trade.entry_price)
+                if price is not None:
+                    await self._exit_trade(price, now, "EOD_SQUARE_OFF")
+                return
+            if not trade.paper_trade:
+                await self._check_broker_stop(trade)
+
+    async def _check_broker_stop(self, trade: Trade):
+        if trade.sl_order_id is None:
+            # An earlier (re)placement failed; keep trying.
+            if await self._place_stop(trade, trade.remaining_qty):
+                await save_trade(trade)
+                await self.notifier.send(f"🛡️ Stop-loss for {trade.id} is in place at the broker")
+            return
+        order = await self.broker.get_order(trade.sl_order_id)
+        if order is None:
+            return
+        if order["status"] == ORDER_FILLED:
+            await self._finish_trade(order["price"] or trade.stop_loss, datetime.utcnow(), "STOP_LOSS")
+        elif order["status"] in (ORDER_CANCELLED, ORDER_REJECTED):
+            await self.notifier.send(
+                f"🚨 Broker stop of {trade.id} was {order['status'].lower()} "
+                f"({order['message'] or 'no reason given'}); placing a new one"
+            )
+            await self._place_stop(trade, trade.remaining_qty)
+            await save_trade(trade)
+
     async def _partial_exit(self, price: float, timestamp: datetime, new_status: TradeStatus, fraction: float):
-        """Execute partial exit at target."""
+        """Execute partial exit at target (in whole lots)."""
         trade = self.active_trade
-        exit_qty = int(trade.initial_qty * fraction)
+        label = "T1" if new_status == TradeStatus.PARTIAL_1 else "T2"
+        lot = self.risk_manager.lot_size_for(trade.symbol)
+        exit_qty = int(trade.initial_qty * fraction) // lot * lot
         exit_qty = min(exit_qty, trade.remaining_qty)
-        
+
+        if exit_qty <= 0:
+            # Too small to split: the whole position rides to the next target.
+            trade.status = new_status
+            await save_trade(trade)
+            await self.notifier.send(
+                f"🎯 {label} HIT at {price}; {trade.remaining_qty} is too small to split, holding it all"
+            )
+            await self._broadcast({"type": "partial_exit", "trade": trade.model_dump()})
+            return
+
+        done = await self._execute_exit(trade, exit_qty, price)
+        if done is None:
+            self._exit_retry_at = time.monotonic() + self.EXIT_RETRY_SECONDS
+            await save_trade(trade)
+            return
+        exit_qty, price, stopped = done
+        if stopped:
+            await self._finish_trade(price, timestamp, "STOP_LOSS")
+            return
+
         pnl = self._calculate_pnl(trade, price, exit_qty)
         trade.realized_pnl += pnl
         trade.remaining_qty -= exit_qty
-        
+
         if new_status == TradeStatus.PARTIAL_1:
             trade.exit_t1_price = price
             trade.exit_t1_qty = exit_qty
             trade.exit_t1_time = timestamp
-            trade.status = TradeStatus.PARTIAL_1
-            await self.notifier.send(f"🎯 T1 HIT! Exited 50% at {price}. PnL: {pnl:.2f}")
-        
-        elif new_status == TradeStatus.PARTIAL_2:
+        else:
             trade.exit_t2_price = price
             trade.exit_t2_qty = exit_qty
             trade.exit_t2_time = timestamp
-            trade.status = TradeStatus.PARTIAL_2
-            await self.notifier.send(f"🎯 T2 HIT! Exited 30% at {price}. PnL: {pnl:.2f}")
-        
+        trade.status = new_status
+        await self.notifier.send(f"🎯 {label} HIT! Exited {exit_qty} at {price}. PnL: {pnl:.2f}")
+
         await save_trade(trade)
         await self._broadcast({"type": "partial_exit", "trade": trade.model_dump()})
-    
+
     async def _exit_trade(self, price: float, timestamp: datetime, reason: str):
-        """Close remaining position."""
+        """Close remaining position (stays open if the broker did not fill)."""
+        trade = self.active_trade
+        done = await self._execute_exit(trade, trade.remaining_qty, price)
+        if done is None:
+            self._exit_retry_at = time.monotonic() + self.EXIT_RETRY_SECONDS
+            await save_trade(trade)
+            return
+        exit_qty, price, stopped = done
+        if stopped:
+            reason = "STOP_LOSS"
+        if exit_qty < trade.remaining_qty:
+            # Only part of the exit filled: book that part, retry the rest.
+            trade.realized_pnl += self._calculate_pnl(trade, price, exit_qty)
+            trade.remaining_qty -= exit_qty
+            await save_trade(trade)
+            self._exit_retry_at = time.monotonic() + self.EXIT_RETRY_SECONDS
+            return
+        await self._finish_trade(price, timestamp, reason)
+
+    async def _finish_trade(self, price: float, timestamp: datetime, reason: str):
+        """Book the close of everything still open at ``price``."""
         trade = self.active_trade
         exit_qty = trade.remaining_qty
-        
+
         pnl = self._calculate_pnl(trade, price, exit_qty)
         trade.realized_pnl += pnl
         trade.remaining_qty = 0
         trade.status = TradeStatus.CLOSED
-        
+        trade.exit_price = price
+        trade.exit_time = timestamp
+        trade.exit_reason = reason
+
         trade.result = SignalResult.WIN if trade.realized_pnl > 0 else SignalResult.LOSS
-        
+
         if reason == "STOP_LOSS":
             trade.exit_sl_price = price
             trade.exit_sl_time = timestamp
@@ -1144,13 +1470,13 @@ class NiftyBot:
             trade.exit_t3_price = price
             trade.exit_t3_qty = exit_qty
             trade.exit_t3_time = timestamp
-        
-        # Update risk manager
+
+        # Update risk manager (saved, so a restart cannot reset the limits)
         self.risk_manager.update_after_trade(trade)
-        self.today_pnl += trade.realized_pnl
-        
+        await self.risk_manager.save()
+
         await save_trade(trade)
-        
+
         emoji = "✅" if trade.result.value == "WIN" else "❌"
         msg = (
             f"{emoji} TRADE CLOSED ({reason})\n"
@@ -1161,26 +1487,138 @@ class NiftyBot:
         )
         await self.notifier.send(msg)
         await self._broadcast({"type": "trade_closed", "trade": trade.model_dump()})
-        
+
         self.active_trade = None
+        self._exit_retry_at = 0.0
 
         # Apply a symbol switch that was deferred while this trade was open.
         if self._pending_symbol_state is not None:
             pending = self._pending_symbol_state
             self._pending_symbol_state = None
             asyncio.ensure_future(self._apply_pending_symbol(pending))
-    
+
     def _calculate_pnl(self, trade: Trade, exit_price: float, qty: int) -> float:
         if trade.direction == Direction.LONG:
             return (exit_price - trade.entry_price) * qty
         else:
             return (trade.entry_price - exit_price) * qty
-    
+
     async def _emergency_exit(self, reason: str):
-        """Emergency exit when bot stops."""
-        if self.active_trade:
-            await self._exit_trade(self.active_trade.entry_price, datetime.now(), f"EMERGENCY: {reason}")
-    
+        """Emergency exit when bot stops (at the last traded price)."""
+        async with self._trade_lock:
+            trade = self.active_trade
+            if trade is None:
+                return
+            price = self._last_price or trade.entry_price
+            await self._exit_trade(price, datetime.utcnow(), f"EMERGENCY: {reason}")
+            if self.active_trade is not None:
+                await self.notifier.send(
+                    f"🚨 {trade.id} is STILL OPEN after '{reason}' — "
+                    "check the Fyers account (the broker stop-loss stays in place)"
+                )
+
+    # ── Restart recovery ──────────────────────────────────────────
+
+    async def _halt(self, reason: str):
+        """Block new trades until the next start."""
+        self.trading_halted = reason
+        print(f"[BOT] New trades blocked: {reason}")
+        await self.notifier.send(f"⛔ New trades blocked: {reason}")
+
+    async def _freeze(self, reason: str):
+        """Stop touching the open trade: its broker state is unknown."""
+        self._trade_frozen = True
+        await self._halt(f"{reason} — check the Fyers account, then restart the bot")
+
+    async def _broker_net_qty(self, symbol: str) -> int:
+        positions = await self.broker.get_positions()
+        return sum(
+            p["net_qty"]
+            for p in positions
+            if p["symbol"] == symbol and (p.get("product") or "INTRADAY") == "INTRADAY"
+        )
+
+    async def _restore_open_trade(self):
+        """Pick up a trade an earlier run left open (crash, restart) and make
+        sure the broker agrees before any new trade is allowed."""
+        self.trading_halted = None
+        self._trade_frozen = False
+        self._exit_retry_at = 0.0
+        self.active_trade = None
+        trade = await get_open_trade()
+
+        if trade is not None and not trade.paper_trade:
+            live_symbol = trade.symbol
+        elif not settings.PAPER_TRADING:
+            live_symbol = self.symbol
+        else:
+            live_symbol = None
+
+        broker_qty = 0
+        if live_symbol is not None:
+            try:
+                broker_qty = await self._broker_net_qty(live_symbol)
+            except Exception as exc:
+                await self._halt(f"could not read broker positions to check {live_symbol}: {exc}")
+                return
+
+        if trade is None:
+            if broker_qty:
+                await self._halt(
+                    f"the broker shows {broker_qty} {live_symbol} open that the bot has no record of"
+                )
+            return
+
+        if trade.symbol != self.symbol:
+            await self._halt(
+                f"open trade {trade.id} is on {trade.symbol} but the active symbol is {self.symbol}"
+            )
+            return
+
+        if trade.paper_trade:
+            self.active_trade = trade
+            print(f"[BOT] Restored open paper trade {trade.id}")
+            return
+
+        expected = self._entry_side(trade) * trade.remaining_qty
+        if broker_qty == expected:
+            self.active_trade = trade
+            await self.notifier.send(f"♻️ Restored open trade {trade.id}; the broker position matches")
+            return
+
+        if broker_qty == 0:
+            # Closed while the bot was away: the broker stop, or the broker's
+            # own end-of-day square-off.
+            self.active_trade = trade
+            stop_fill = await self._broker_stop_fill(trade)
+            if stop_fill is not None:
+                await self._finish_trade(stop_fill, datetime.utcnow(), "STOP_LOSS")
+                return
+            # A stop still resting at the broker would, if it fired, open a
+            # position the other way.
+            if trade.sl_order_id and not await self.broker.cancel_order(trade.sl_order_id):
+                await self.notifier.send(
+                    f"🚨 Could not cancel stop order {trade.sl_order_id} of closed trade "
+                    f"{trade.id} — cancel it in the Fyers account"
+                )
+            # Exit price unknown: P&L stays at what was booked, the result is
+            # left empty, and the limits are not touched.
+            trade.remaining_qty = 0
+            trade.status = TradeStatus.CLOSED
+            trade.exit_reason = "CLOSED_OUTSIDE_BOT"
+            trade.exit_time = datetime.utcnow()
+            await save_trade(trade)
+            self.active_trade = None
+            await self.notifier.send(
+                f"⚠️ {trade.id} was closed outside the bot (exit price unknown); "
+                "check its P&L in the Fyers account"
+            )
+            return
+
+        await self._halt(
+            f"broker position {broker_qty} {trade.symbol} does not match trade {trade.id} ({expected})"
+        )
+
     # ── WebSocket broadcast ───────────────────────────────────────
     def add_websocket_client(self, ws: WebSocket):
         self.ws_clients.append(ws)
@@ -1190,6 +1628,10 @@ class NiftyBot:
             self.ws_clients.remove(ws)
     
     async def _broadcast(self, data: dict):
+        # Messages carry datetimes and enums (trades, signals, candles); plain
+        # json.dumps raised on them, and the client was dropped as if it had
+        # disconnected.
+        data = jsonable_encoder(data)
         disconnected = []
         for client in self.ws_clients:
             try:

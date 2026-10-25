@@ -106,7 +106,9 @@ async def init_db():
                 realized_pnl REAL, result TEXT,
                 signal_score INTEGER, confidence REAL, paper_trade INTEGER,
                 symbol TEXT NOT NULL DEFAULT '',
-                symbol_name TEXT NOT NULL DEFAULT ''
+                symbol_name TEXT NOT NULL DEFAULT '',
+                exit_price REAL, exit_time TEXT, exit_reason TEXT,
+                entry_order_id TEXT, sl_order_id TEXT
             )
         """)
 
@@ -143,6 +145,11 @@ async def init_db():
         await _add_missing_columns(db, "trades", {
             "symbol": "TEXT NOT NULL DEFAULT ''",
             "symbol_name": "TEXT NOT NULL DEFAULT ''",
+            "exit_price": "REAL",
+            "exit_time": "TEXT",
+            "exit_reason": "TEXT",
+            "entry_order_id": "TEXT",
+            "sl_order_id": "TEXT",
         })
 
 
@@ -312,75 +319,70 @@ async def save_signal(signal: Signal, symbol: str = "", symbol_name: str = ""):
         )
 
 
+#: Trade fields stored in the trades table, in column order.
+_TRADE_COLUMNS = (
+    "id", "entry_time", "direction", "entry_price", "quantity",
+    "initial_qty", "remaining_qty", "status",
+    "stop_loss", "target_1", "target_2", "target_3",
+    "exit_t1_price", "exit_t1_qty", "exit_t1_time",
+    "exit_t2_price", "exit_t2_qty", "exit_t2_time",
+    "exit_t3_price", "exit_t3_qty", "exit_t3_time",
+    "exit_sl_price", "exit_sl_time",
+    "realized_pnl", "result", "signal_score", "confidence", "paper_trade",
+    "symbol", "symbol_name",
+    "exit_price", "exit_time", "exit_reason",
+    "entry_order_id", "sl_order_id",
+)
+_TRADE_TIMES = {"entry_time", "exit_t1_time", "exit_t2_time", "exit_t3_time", "exit_sl_time", "exit_time"}
+
+
+def _trade_value(trade: Trade, column: str):
+    value = getattr(trade, column)
+    if value is None:
+        return None
+    if column in _TRADE_TIMES:
+        return value.isoformat()
+    if column in ("direction", "status", "result"):
+        return value.value
+    if column == "paper_trade":
+        return int(value)
+    return value
+
+
 async def save_trade(trade: Trade):
+    # Placeholders are generated from the column list: a hand-counted list
+    # once had one "?" too few, so SQLite rejected every trade ever saved.
+    columns = ", ".join(_TRADE_COLUMNS)
+    marks = ", ".join("?" for _ in _TRADE_COLUMNS)
     async with _db() as db:
         await db.execute(
-            """
-            INSERT OR REPLACE INTO trades (
-                id, entry_time, direction, entry_price, quantity,
-                initial_qty, remaining_qty, status,
-                stop_loss, target_1, target_2, target_3,
-                exit_t1_price, exit_t1_qty, exit_t1_time,
-                exit_t2_price, exit_t2_qty, exit_t2_time,
-                exit_t3_price, exit_t3_qty, exit_t3_time,
-                exit_sl_price, exit_sl_time,
-                realized_pnl, result, signal_score, confidence, paper_trade,
-                symbol, symbol_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                trade.id, trade.entry_time.isoformat(), trade.direction.value,
-                trade.entry_price, trade.quantity, trade.initial_qty,
-                trade.remaining_qty, trade.status.value, trade.stop_loss,
-                trade.target_1, trade.target_2, trade.target_3,
-                trade.exit_t1_price, trade.exit_t1_qty,
-                trade.exit_t1_time.isoformat() if trade.exit_t1_time else None,
-                trade.exit_t2_price, trade.exit_t2_qty,
-                trade.exit_t2_time.isoformat() if trade.exit_t2_time else None,
-                trade.exit_t3_price, trade.exit_t3_qty,
-                trade.exit_t3_time.isoformat() if trade.exit_t3_time else None,
-                trade.exit_sl_price,
-                trade.exit_sl_time.isoformat() if trade.exit_sl_time else None,
-                trade.realized_pnl, trade.result.value if trade.result else None,
-                trade.signal_score, trade.confidence, int(trade.paper_trade),
-                trade.symbol, trade.symbol_name,
-            ),
+            f"INSERT OR REPLACE INTO trades ({columns}) VALUES ({marks})",
+            tuple(_trade_value(trade, c) for c in _TRADE_COLUMNS),
         )
 
 
 def _row_to_trade(row) -> Trade:
-    return Trade(
-        id=row["id"],
-        entry_time=datetime.fromisoformat(row["entry_time"]),
-        direction=row["direction"],
-        entry_price=row["entry_price"],
-        quantity=row["quantity"],
-        initial_qty=row["initial_qty"],
-        remaining_qty=row["remaining_qty"],
-        status=row["status"],
-        stop_loss=row["stop_loss"],
-        target_1=row["target_1"],
-        target_2=row["target_2"],
-        target_3=row["target_3"],
-        exit_t1_price=row["exit_t1_price"],
-        exit_t1_qty=row["exit_t1_qty"],
-        exit_t1_time=datetime.fromisoformat(row["exit_t1_time"]) if row["exit_t1_time"] else None,
-        exit_t2_price=row["exit_t2_price"],
-        exit_t2_qty=row["exit_t2_qty"],
-        exit_t2_time=datetime.fromisoformat(row["exit_t2_time"]) if row["exit_t2_time"] else None,
-        exit_t3_price=row["exit_t3_price"],
-        exit_t3_qty=row["exit_t3_qty"],
-        exit_t3_time=datetime.fromisoformat(row["exit_t3_time"]) if row["exit_t3_time"] else None,
-        exit_sl_price=row["exit_sl_price"],
-        exit_sl_time=datetime.fromisoformat(row["exit_sl_time"]) if row["exit_sl_time"] else None,
-        realized_pnl=row["realized_pnl"],
-        result=row["result"],
-        signal_score=row["signal_score"],
-        confidence=row["confidence"],
-        paper_trade=bool(row["paper_trade"]),
-        symbol=row["symbol"] or "",
-        symbol_name=row["symbol_name"] or "",
-    )
+    keys = set(row.keys())
+    values = {}
+    for column in _TRADE_COLUMNS:
+        value = row[column] if column in keys else None
+        if column in _TRADE_TIMES and value:
+            value = datetime.fromisoformat(value)
+        values[column] = value
+    values["paper_trade"] = bool(values["paper_trade"])
+    values["symbol"] = values["symbol"] or ""
+    values["symbol_name"] = values["symbol_name"] or ""
+    return Trade(**values)
+
+
+async def get_open_trade() -> Optional[Trade]:
+    """The newest trade that is not closed, if any (left by an earlier run)."""
+    async with _db() as db:
+        cursor = await db.execute(
+            "SELECT * FROM trades WHERE status != 'CLOSED' ORDER BY entry_time DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+    return _row_to_trade(row) if row is not None else None
 
 
 async def get_recent_trades(limit: int = 20) -> List[Trade]:

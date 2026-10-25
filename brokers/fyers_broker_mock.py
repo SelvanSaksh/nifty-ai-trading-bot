@@ -7,7 +7,7 @@ import random
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Callable
 
-from brokers.base import BaseBroker
+from brokers.base import BaseBroker, ORDER_CANCELLED, ORDER_FILLED, ORDER_PENDING
 from models.candle import Candle
 from models.trade import Trade
 from config import settings
@@ -44,6 +44,9 @@ class FyersBroker(BaseBroker):
         self._session: Optional[asyncio.Task] = None
         self._symbol_prices: Dict[str, float] = {}
         self._day_volume: Dict[str, int] = {}
+        self._orders: Dict[str, Dict[str, Any]] = {}
+        self._order_seq = 0
+        self._net_qty: Dict[str, int] = {}
     
     async def connect(self) -> bool:
         self.is_connected = True
@@ -186,24 +189,70 @@ class FyersBroker(BaseBroker):
         return candles
     
     async def place_order(self, trade: Trade) -> Dict[str, Any]:
-        """Mock order placement."""
-        return {
-            "s": "ok",
-            "id": f"PAPER_{trade.id}",
-            "message": "Paper trade executed",
-            "order_id": f"MOCK_{datetime.now().strftime('%H%M%S')}"
+        """Mock entry order (fills at once, like every mock market order)."""
+        side = 1 if trade.direction.value == "LONG" else -1
+        return await self.place_market_order(trade.symbol, side, trade.quantity)
+
+    # Simulated order book: market orders fill at once at the simulated
+    # price; stop orders wait (the engine's own stop check exits the trade).
+
+    def _new_order(self, symbol: str, side: int, qty: int, **fields) -> Dict[str, Any]:
+        self._order_seq += 1
+        order = {
+            "id": f"MOCK{self._order_seq}",
+            "symbol": symbol,
+            "side": side,
+            "qty": int(qty),
+            "status": ORDER_PENDING,
+            "filled_qty": 0,
+            "price": None,
+            "message": "",
+            **fields,
         }
-    
+        self._orders[order["id"]] = order
+        return order
+
+    async def place_market_order(self, symbol: str, side: int, qty: int) -> Dict[str, Any]:
+        order = self._new_order(symbol, side, qty)
+        price = self._symbol_prices.get(symbol) or self._DEFAULT_PRICES.get(symbol, 24500.0)
+        order.update(status=ORDER_FILLED, filled_qty=int(qty), price=price)
+        self._net_qty[symbol] = self._net_qty.get(symbol, 0) + side * int(qty)
+        return {"s": "ok", "id": order["id"], "message": "Mock order filled"}
+
+    async def place_stop_order(self, symbol: str, side: int, qty: int, stop_price: float) -> Dict[str, Any]:
+        order = self._new_order(symbol, side, qty, stop_price=stop_price)
+        return {"s": "ok", "id": order["id"], "message": "Mock stop placed"}
+
+    async def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        order = self._orders.get(order_id)
+        if order is None:
+            return None
+        return {k: order[k] for k in ("id", "status", "filled_qty", "price", "message")}
+
     async def modify_order(self, order_id: str, **kwargs) -> bool:
+        order = self._orders.get(order_id)
+        if order is None or order["status"] != ORDER_PENDING:
+            return False
+        if "qty" in kwargs:
+            order["qty"] = int(kwargs["qty"])
+        if "stopPrice" in kwargs:
+            order["stop_price"] = kwargs["stopPrice"]
         print(f"[MOCK] Modified order: {order_id}")
         return True
     
     async def cancel_order(self, order_id: str) -> bool:
+        order = self._orders.get(order_id)
+        if order is None or order["status"] != ORDER_PENDING:
+            return False
+        order["status"] = ORDER_CANCELLED
         print(f"[MOCK] Cancelled order: {order_id}")
         return True
     
     async def get_positions(self) -> list[Dict[str, Any]]:
-        return []
+        return [
+            {"symbol": symbol, "net_qty": qty, "product": "INTRADAY"}
+            for symbol, qty in self._net_qty.items()
+        ]
     
     async def get_funds(self) -> Dict[str, float]:
         return {"available": settings.CAPITAL, "used": 0.0}

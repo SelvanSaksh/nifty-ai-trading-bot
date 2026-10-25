@@ -8,7 +8,13 @@ import aiohttp
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable, List
 
-from brokers.base import BaseBroker
+from brokers.base import (
+    BaseBroker,
+    ORDER_CANCELLED,
+    ORDER_FILLED,
+    ORDER_PENDING,
+    ORDER_REJECTED,
+)
 from models.candle import Candle
 from models.trade import Trade
 from config import settings
@@ -573,48 +579,137 @@ class FyersBroker(BaseBroker):
             )
         return candles
     
-    async def place_order(self, trade: Trade) -> Dict[str, Any]:
-        """Place order via REST API."""
-        if settings.PAPER_TRADING:
-            return {"s": "ok", "id": f"PAPER_{trade.id}", "message": "Paper trade"}
-        
-        order_data = {
-            "symbol": trade.symbol,
-            "qty": trade.quantity,
-            "type": 2,
-            "side": 1 if trade.direction.value == "LONG" else -1,
+    # ── Orders ────────────────────────────────────────────────────
+    #
+    # Endpoints as the official SDK (fyers_apiv3) uses them: orders are
+    # placed, modified and cancelled at /orders/sync; GET /orders is the
+    # order book. (POST /orders is not an order endpoint at all.)
+
+    ORDERS_PATH = "/orders/sync"
+    ORDER_BOOK_PATH = "/orders"
+    #: Order-book ``status`` codes -> normalized states. Anything else
+    #: (4 transit, 6 pending, ...) is still working.
+    ORDER_STATUS = {
+        1: ORDER_CANCELLED,
+        2: ORDER_FILLED,
+        5: ORDER_REJECTED,
+        7: ORDER_CANCELLED,  # expired
+    }
+    #: NSE price step; a trigger price off the step is rejected.
+    TICK_SIZE = 0.05
+
+    async def _trading_call(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
+        """One trading-API request. Always a dict; ``s`` is "ok" only on success.
+
+        Fyers answers some failures with a non-JSON body, so the reply is
+        never assumed to be JSON.
+        """
+        session = await self._ensure_session()
+        try:
+            async with session.request(
+                method, f"{self.BASE_URL}{path}", headers={"version": "3"}, **kwargs
+            ) as resp:
+                status = resp.status
+                raw = await resp.text()
+        except Exception as e:
+            return {"s": "error", "message": f"request failed: {e}"}
+        try:
+            data = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            data = None
+        if not isinstance(data, dict):
+            return {"s": "error", "message": f"HTTP {status}: {(raw or '')[:200]}"}
+        if status in (401, 403):
+            from fyers_auth import mark_token_rejected
+            mark_token_rejected()
+        return data
+
+    @classmethod
+    def _to_tick(cls, price: float) -> float:
+        return round(round(price / cls.TICK_SIZE) * cls.TICK_SIZE, 2)
+
+    @staticmethod
+    def _order_payload(symbol: str, side: int, qty: int, order_type: int, stop_price: float = 0) -> Dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "qty": int(qty),
+            "type": order_type,  # 2 market, 3 stop-loss market (SL-M)
+            "side": int(side),
             "productType": "INTRADAY",
             "limitPrice": 0,
-            "stopPrice": 0,
+            "stopPrice": stop_price,
             "validity": "DAY",
             "disclosedQty": 0,
             "offlineOrder": False,
-            "stopLoss": trade.stop_loss,
-            "takeProfit": trade.target_1
+            # Only used by bracket/cover orders.
+            "stopLoss": 0,
+            "takeProfit": 0,
         }
-        
-        session = await self._ensure_session()
-        async with session.post(f"{self.BASE_URL}/orders", json=order_data) as resp:
-            return await resp.json()
-    
+
+    async def place_order(self, trade: Trade) -> Dict[str, Any]:
+        """Entry market order for ``trade`` (never sent in paper mode)."""
+        if settings.PAPER_TRADING or trade.paper_trade:
+            return {"s": "ok", "id": f"PAPER_{trade.id}", "message": "Paper trade"}
+        side = 1 if trade.direction.value == "LONG" else -1
+        return await self.place_market_order(trade.symbol, side, trade.quantity)
+
+    async def place_market_order(self, symbol: str, side: int, qty: int) -> Dict[str, Any]:
+        return await self._trading_call(
+            "POST", self.ORDERS_PATH, json=self._order_payload(symbol, side, qty, 2)
+        )
+
+    async def place_stop_order(self, symbol: str, side: int, qty: int, stop_price: float) -> Dict[str, Any]:
+        return await self._trading_call(
+            "POST",
+            self.ORDERS_PATH,
+            json=self._order_payload(symbol, side, qty, 3, self._to_tick(stop_price)),
+        )
+
+    async def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        data = await self._trading_call("GET", self.ORDER_BOOK_PATH, params={"id": order_id})
+        if data.get("s") != "ok":
+            print(f"[FYERS] Order {order_id} unreadable: {data.get('message')}")
+            return None
+        for order in data.get("orderBook") or []:
+            if str(order.get("id")) != str(order_id):
+                continue
+            price = order.get("tradedPrice")
+            return {
+                "id": str(order_id),
+                "status": self.ORDER_STATUS.get(order.get("status"), ORDER_PENDING),
+                "filled_qty": int(order.get("filledQty") or 0),
+                "price": float(price) if price else None,
+                "message": order.get("message") or "",
+            }
+        return None
+
     async def modify_order(self, order_id: str, **kwargs) -> bool:
-        data = {"id": order_id, **kwargs}
-        session = await self._ensure_session()
-        async with session.patch(f"{self.BASE_URL}/orders", json=data) as resp:
-            result = await resp.json()
-            return result.get("s") == "ok"
-    
+        if "stopPrice" in kwargs:
+            kwargs["stopPrice"] = self._to_tick(kwargs["stopPrice"])
+        result = await self._trading_call("PATCH", self.ORDERS_PATH, json={"id": order_id, **kwargs})
+        if result.get("s") != "ok":
+            print(f"[FYERS] Modify {order_id} failed: {result.get('message')}")
+        return result.get("s") == "ok"
+
     async def cancel_order(self, order_id: str) -> bool:
-        session = await self._ensure_session()
-        async with session.delete(f"{self.BASE_URL}/orders", params={"id": order_id}) as resp:
-            result = await resp.json()
-            return result.get("s") == "ok"
-    
+        result = await self._trading_call("DELETE", self.ORDERS_PATH, json={"id": order_id})
+        if result.get("s") != "ok":
+            print(f"[FYERS] Cancel {order_id} failed: {result.get('message')}")
+        return result.get("s") == "ok"
+
     async def get_positions(self) -> list[Dict[str, Any]]:
-        session = await self._ensure_session()
-        async with session.get(f"{self.BASE_URL}/positions") as resp:
-            data = await resp.json()
-            return data.get("netPositions", [])
+        data = await self._trading_call("GET", "/positions")
+        if data.get("s") != "ok":
+            # Raising, not []: an empty list would read as "no position".
+            raise ConnectionError(f"Fyers positions unavailable: {data.get('message')}")
+        return [
+            {
+                "symbol": p.get("symbol"),
+                "net_qty": int(p.get("netQty") or 0),
+                "product": p.get("productType"),
+            }
+            for p in data.get("netPositions") or []
+        ]
     
     async def get_funds(self) -> Dict[str, float]:
         session = await self._ensure_session()

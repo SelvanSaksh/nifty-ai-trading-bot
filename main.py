@@ -238,6 +238,8 @@ async def get_status():
         "active_trade": bot.active_trade.model_dump() if bot.active_trade else None,
         "paper_mode": settings.PAPER_TRADING,
         "today_pnl": round(bot.today_pnl, 2),
+        # Why new trades are blocked (broker position mismatch, ...), or null.
+        "trading_halted": bot.trading_halted,
         "symbol": active["symbol"],
         "symbol_name": active["symbol_name"],
         "symbol_version": active["version"],

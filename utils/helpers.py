@@ -106,7 +106,8 @@ def is_pre_market(now: datetime = None) -> bool:
 
 def round_to_tick(price: float, tick_size: float = 0.05) -> float:
     """Round price to nearest tick size (Nifty tick = 0.05)."""
-    return round(price / tick_size) * tick_size
+    # The outer round drops float noise (24500.100000000002 -> 24500.1).
+    return round(round(price / tick_size) * tick_size, 2)
 
 
 def round_to_lot(qty: int, lot_size: int = 50) -> int:
