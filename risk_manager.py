@@ -93,6 +93,23 @@ class RiskManager:
             changed = True
         return changed
 
+    # ── Limits ────────────────────────────────────────────────────
+
+    @property
+    def daily_loss_limit(self) -> float:
+        """Daily P&L (₹, negative) at or below which no new trade opens."""
+        return -settings.CAPITAL * settings.MAX_DAILY_LOSS
+
+    @property
+    def weekly_loss_limit(self) -> float:
+        """Weekly P&L (₹, negative) at or below which no new trade opens."""
+        return -settings.CAPITAL * settings.MAX_WEEKLY_LOSS
+
+    @property
+    def max_trades_per_day(self) -> int:
+        """Closed trades per day after which no new trade opens."""
+        return settings.MAX_TRADES_PER_DAY
+
     # ── Gates ─────────────────────────────────────────────────────
 
     async def can_trade(self, now: datetime = None) -> Tuple[bool, str]:
@@ -119,18 +136,18 @@ class RiskManager:
             return False, f"Outside trading hours ({settings.TRADING_START_TIME}-{end.strftime('%H:%M')} IST)"
 
         # ── 2. Daily loss limit ───────────────────────────────────
-        daily_loss_limit = -settings.CAPITAL * settings.MAX_DAILY_LOSS
+        daily_loss_limit = self.daily_loss_limit
         if self.daily_pnl <= daily_loss_limit:
             return False, f"Daily loss limit hit: ₹{self.daily_pnl:,.2f} (limit: ₹{daily_loss_limit:,.2f})"
 
         # ── 3. Weekly loss limit ──────────────────────────────────
-        weekly_loss_limit = -settings.CAPITAL * settings.MAX_WEEKLY_LOSS
+        weekly_loss_limit = self.weekly_loss_limit
         if self.weekly_pnl <= weekly_loss_limit:
             return False, f"Weekly loss limit hit: ₹{self.weekly_pnl:,.2f} (limit: ₹{weekly_loss_limit:,.2f})"
 
         # ── 4. Max trades per day ─────────────────────────────────
-        if self.trades_today >= settings.MAX_TRADES_PER_DAY:
-            return False, f"Max trades per day reached: {self.trades_today}/{settings.MAX_TRADES_PER_DAY}"
+        if self.trades_today >= self.max_trades_per_day:
+            return False, f"Max trades per day reached: {self.trades_today}/{self.max_trades_per_day}"
 
         # ── 5. Loss cooldown ──────────────────────────────────────
         if self.cooldown_until and now < self.cooldown_until:

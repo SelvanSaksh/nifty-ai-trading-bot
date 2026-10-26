@@ -520,6 +520,10 @@ async def get_risk_status():
         "trades_today": rm.trades_today,
         "consecutive_losses": rm.consecutive_losses,
         "cooldown_until": rm.cooldown_until.isoformat() if rm.cooldown_until else None,
+        # The limits the gate checks the values above against.
+        "daily_loss_limit": round(rm.daily_loss_limit, 2),
+        "weekly_loss_limit": round(rm.weekly_loss_limit, 2),
+        "max_trades_per_day": rm.max_trades_per_day,
     }
 
 
