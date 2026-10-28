@@ -152,24 +152,13 @@ class MCPTools:
     # ── Tool 7: get_config_summary ──────────────────────────────
     async def get_config_summary(self) -> Dict[str, Any]:
         """Key configuration values (safe, no secrets)."""
-        from config import settings
-        
-        return {
-            "paper_trading": settings.PAPER_TRADING,
-            "capital": settings.CAPITAL,
-            "risk_per_trade": settings.RISK_PER_TRADE,
-            "max_daily_loss": settings.MAX_DAILY_LOSS,
-            "max_weekly_loss": settings.MAX_WEEKLY_LOSS,
-            "max_trades_per_day": settings.MAX_TRADES_PER_DAY,
-            "min_score_threshold": settings.MIN_SCORE_THRESHOLD,
-            "min_risk_reward": settings.MIN_RISK_REWARD,
-            "primary_timeframe": settings.PRIMARY_TIMEFRAME,
-            "higher_timeframe": settings.HIGHER_TIMEFRAME,
-            "trading_hours": f"{settings.TRADING_START_TIME} - {settings.TRADING_END_TIME}",
-            "cooldown_minutes": settings.COOLDOWN_MINUTES,
-            "news_blackout_minutes": settings.NEWS_BLACKOUT_MINUTES,
-        }
-    
+        from config import public_config
+
+        config = public_config()
+        # Kept for MCP clients that read the combined hours string.
+        config["trading_hours"] = f"{config['trading_start_time']} - {config['trading_end_time']}"
+        return config
+
     # ── Tool 8: explain_latest_signal ───────────────────────────
     async def explain_latest_signal(self) -> Dict[str, Any]:
         """Human-readable rationale for the latest signal."""

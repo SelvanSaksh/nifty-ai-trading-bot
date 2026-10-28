@@ -18,6 +18,7 @@ from decision_engine import DecisionEngine
 from risk_manager import RiskManager
 from database import (
     save_candle,
+    save_decision,
     save_signal,
     save_trade,
     get_open_trade,
@@ -36,6 +37,7 @@ from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError, SingletonFileLock
 from utils.market_structure import DEFAULT_STRENGTH, StructureTracker, closed_candles
 from utils.live_bars import LiveBarTracker, in_session
+from utils.market_status import is_live_session_tick, market_status
 from utils.helpers import (
     LIVE_TIMEFRAMES,
     TIMEFRAME_MINUTES,
@@ -107,6 +109,9 @@ class NiftyBot:
         self._exit_retry_at = 0.0  # time.monotonic()
         # Last traded price of the active symbol.
         self._last_price: Optional[float] = None
+        # Receive time (naive UTC) of the last tick, of any symbol, printed
+        # inside today's session: the market is live, not just scheduled.
+        self._last_live_tick_at: Optional[datetime] = None
 
         self.symbol: str = settings.TRADING_SYMBOL
         self.symbol_name: str = settings.TRADING_SYMBOL_NAME
@@ -895,7 +900,9 @@ class NiftyBot:
         # do; the receive time is only a fallback (missing/implausible value).
         exchange_at = self._exchange_time(tick, received_at)
         timestamp = exchange_at or received_at
-        
+        if is_live_session_tick(timestamp, received_at):
+            self._last_live_tick_at = received_at
+
         # ``v`` is the day's cumulative traded volume, not this tick's.
         traded = self._traded_since_last_tick(tick_symbol, volume, received_at)
 
@@ -1007,13 +1014,15 @@ class NiftyBot:
             }
     
     async def _on_candle_close(self, candle: Candle):
-        """Full decision cycle on closed candle."""
+        """Full decision cycle on closed candle. Every cycle ends in exactly
+        one recorded decision (see ``_record_decision``)."""
         # Save candle to DB
         await save_candle(candle, self.symbol)
 
         # Check if trading allowed — NOW WITH await
         can_trade, reason = await self.risk_manager.can_trade()
         if not can_trade:
+            await self._record_decision(candle, "BLOCKED", reason)
             await self._broadcast({
                 "type": "skip",
                 "reason": reason,
@@ -1036,6 +1045,11 @@ class NiftyBot:
         signal = self.decision_engine.evaluate(analysis)
         signal.symbol = self.symbol
         signal.symbol_name = self.symbol_name
+        # Both sides' scores: a WAIT signal carries score 0 whatever they were.
+        scores = (
+            self.decision_engine._score_long(analysis),
+            self.decision_engine._score_short(analysis),
+        )
 
         # Save signal
         await save_signal(signal, self.symbol, self.symbol_name)
@@ -1046,15 +1060,52 @@ class NiftyBot:
 
         # Validate and enter if passes
         valid, validation_reason = self.risk_manager.validate_signal(signal)
-        if valid and signal.direction != Direction.WAIT:
+        if signal.direction == Direction.WAIT:
+            outcome, why = "WAIT", signal.reasoning
+        elif not valid:
+            outcome, why = "REJECTED", validation_reason
+        else:
             validation_reason = await self._enter_trade(signal, candle.close)
             if validation_reason is None:
+                await self._record_decision(
+                    candle, "ENTERED", f"{signal.direction.value} trade opened", signal, scores
+                )
                 return
+            outcome, why = "NOT_ENTERED", validation_reason
+        await self._record_decision(candle, outcome, why, signal, scores)
         await self._broadcast({
             "type": "wait",
             "reason": validation_reason,
             "signal_score": signal.score
         })
+
+    async def _record_decision(
+        self,
+        candle: Candle,
+        outcome: str,
+        reason: str,
+        signal: Optional[Signal] = None,
+        scores: Optional[Tuple[int, int]] = None,
+    ):
+        """Store and broadcast what this candle close led to, and why."""
+        decision = await save_decision({
+            "candle_time": candle.timestamp.isoformat(),
+            "recorded_at": datetime.utcnow().isoformat(),
+            "symbol": self.symbol,
+            "timeframe": candle.timeframe,
+            "outcome": outcome,
+            "reason": reason or "",
+            "direction": signal.direction.value if signal else None,
+            "score": signal.score if signal else None,
+            "long_score": scores[0] if scores else None,
+            "short_score": scores[1] if scores else None,
+            "price": candle.close,
+        })
+        await self._broadcast({"type": "decision", "decision": decision})
+
+    def get_market_status(self) -> Dict[str, Any]:
+        """Open, closed, or session hours without live ticks (holiday/feed)."""
+        return market_status(datetime.utcnow(), self._last_live_tick_at)
 
     # ── Trades ────────────────────────────────────────────────────
     #

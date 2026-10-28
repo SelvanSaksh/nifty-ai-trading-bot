@@ -23,9 +23,14 @@ from urllib.parse import unquote
 from pydantic import BaseModel, Field
 
 from bot import NiftyBot, SymbolConflictError, SymbolValidationError
-from database import init_db, get_active_symbol_state, get_symbol_change_history
+from database import (
+    init_db,
+    get_active_symbol_state,
+    get_recent_decisions,
+    get_symbol_change_history,
+)
 from trading_mcp.server import mcp_app, set_bot_instance
-from config import settings, ensure_data_dir
+from config import settings, ensure_data_dir, public_config
 from fyers_auth import (
     auth_status,
     effective_redirect_uri,
@@ -249,7 +254,22 @@ async def get_status():
         "symbol_in_sync": (not bot.is_running) or (
             bot.symbol == active["symbol"] and bot.symbol_version == active["version"]
         ),
+        # Session hours plus live-tick evidence (no holiday calendar).
+        "market": bot.get_market_status(),
     }
+
+
+@app.get("/api/config")
+async def get_config():
+    """The rules the engine trades by (read-only, no secrets)."""
+    return public_config()
+
+
+@app.get("/api/decisions")
+async def get_decisions(limit: int = 50):
+    """What each closed decision candle led to and why, newest first."""
+    limit = max(1, min(limit, 200))
+    return {"decisions": await get_recent_decisions(limit)}
 
 
 @app.get("/api/stats")

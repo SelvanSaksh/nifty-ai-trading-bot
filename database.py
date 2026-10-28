@@ -136,6 +136,29 @@ async def init_db():
             )
         """)
 
+        # One row per closed decision candle: what the engine decided and why
+        # (blocked by the risk gate, no setup, rejected, entered). The
+        # dashboard's decision timeline reads it.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candle_time TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                direction TEXT,
+                score INTEGER,
+                long_score INTEGER,
+                short_score INTEGER,
+                price REAL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decisions_candle_time ON decisions (candle_time)"
+        )
+
         # Migrate pre-existing databases
         await _add_missing_columns(db, "candles", {"symbol": "TEXT NOT NULL DEFAULT ''"})
         await _add_missing_columns(db, "signals", {
@@ -419,3 +442,40 @@ async def get_recent_signals(limit: int = 20) -> List[Signal]:
             )
             signals.append(signal)
         return signals
+
+
+# ── Decisions ────────────────────────────────────────────────────
+
+#: Outcomes of a decision cycle, in the order the checks run.
+DECISION_OUTCOMES = ("BLOCKED", "WAIT", "REJECTED", "NOT_ENTERED", "ENTERED")
+
+_DECISION_COLUMNS = (
+    "candle_time", "recorded_at", "symbol", "timeframe", "outcome", "reason",
+    "direction", "score", "long_score", "short_score", "price",
+)
+
+
+async def save_decision(decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Store one decision (keys: ``_DECISION_COLUMNS``); returns it with its id."""
+    if decision["outcome"] not in DECISION_OUTCOMES:
+        raise ValueError(f"unknown decision outcome {decision['outcome']!r}")
+    values = [decision.get(column) for column in _DECISION_COLUMNS]
+    async with _db() as db:
+        cursor = await db.execute(
+            f"INSERT INTO decisions ({', '.join(_DECISION_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in _DECISION_COLUMNS)})",
+            values,
+        )
+        return {"id": cursor.lastrowid, **{c: decision.get(c) for c in _DECISION_COLUMNS}}
+
+
+async def get_recent_decisions(limit: int = 50) -> List[Dict[str, Any]]:
+    """Newest first."""
+    async with _db() as db:
+        cursor = await db.execute(
+            f"SELECT id, {', '.join(_DECISION_COLUMNS)} FROM decisions "
+            "ORDER BY candle_time DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+    return [dict(row) for row in rows]

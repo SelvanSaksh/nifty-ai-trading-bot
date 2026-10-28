@@ -91,6 +91,31 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def public_config() -> dict:
+    """The rules the engine trades by, safe to show anyone: no credentials,
+    tokens or keys. Served by GET /api/config and the MCP config tool."""
+    return {
+        "paper_trading": settings.PAPER_TRADING,
+        "broker_mode": settings.BROKER_MODE,
+        "trading_symbol": settings.TRADING_SYMBOL,
+        "capital": settings.CAPITAL,
+        "risk_per_trade": settings.RISK_PER_TRADE,
+        "max_daily_loss": settings.MAX_DAILY_LOSS,
+        "max_weekly_loss": settings.MAX_WEEKLY_LOSS,
+        "max_trades_per_day": settings.MAX_TRADES_PER_DAY,
+        "cooldown_minutes": settings.COOLDOWN_MINUTES,
+        "news_blackout_minutes": settings.NEWS_BLACKOUT_MINUTES,
+        "min_score_threshold": settings.MIN_SCORE_THRESHOLD,
+        "min_risk_reward": settings.MIN_RISK_REWARD,
+        "primary_timeframe": settings.PRIMARY_TIMEFRAME,
+        "higher_timeframe": settings.HIGHER_TIMEFRAME,
+        "trading_start_time": settings.TRADING_START_TIME,
+        "trading_end_time": settings.TRADING_END_TIME,
+        "square_off_time": settings.SQUARE_OFF_TIME,
+        "lot_size": settings.LOT_SIZE,
+    }
+
+
 def ensure_data_dir():
     """Ensure data directory exists."""
     Path("data").mkdir(exist_ok=True)
