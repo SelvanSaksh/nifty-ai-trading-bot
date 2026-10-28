@@ -162,11 +162,18 @@ class Analyzer:
         price_making_lower_lows = all(recent[i].low < recent[i-1].low for i in range(1, len(recent)))
         rsi_values = [c.rsi for c in recent if c.rsi is not None]
         
+        # The mirror image: higher highs in price on falling RSI. The SHORT
+        # score reads "bearish_divergence", which used to be never produced.
+        price_making_higher_highs = all(recent[i].high > recent[i-1].high for i in range(1, len(recent)))
+
         if len(rsi_values) >= 5:
             rsi_making_higher_lows = all(rsi_values[i] > rsi_values[i-1] for i in range(1, len(rsi_values)))
             if price_making_lower_lows and rsi_making_higher_lows:
                 return "bullish_divergence"
-        
+            rsi_making_lower_highs = all(rsi_values[i] < rsi_values[i-1] for i in range(1, len(rsi_values)))
+            if price_making_higher_highs and rsi_making_lower_highs:
+                return "bearish_divergence"
+
         return None
     
     def _detect_fair_value_gap(self, series: Optional[List[Candle]] = None) -> Optional[Dict]:
@@ -226,20 +233,23 @@ class Analyzer:
         news_blackout = await news_monitor.is_blackout_active()
         active_blackouts = await news_monitor.get_active_blackouts() if news_blackout else []
     
+        opt = options_ctx  # None while no options data source is connected
         return {
-            "pcr": options_ctx.pcr,
-            "vix_regime": options_ctx.vix_regime,
-            "max_pain": options_ctx.max_pain_strike,
-            "call_oi": options_ctx.call_oi_total,
-            "put_oi": options_ctx.put_oi_total,
+            # False: the options fields below are null, never made up.
+            "options_available": opt is not None,
+            "pcr": opt.pcr if opt else None,
+            "vix_regime": opt.vix_regime if opt else None,
+            "max_pain": opt.max_pain_strike if opt else None,
+            "call_oi": opt.call_oi_total if opt else None,
+            "put_oi": opt.put_oi_total if opt else None,
             "oi_change": {
-                "call": options_ctx.call_oi_change,
-                "put": options_ctx.put_oi_change
+                "call": opt.call_oi_change if opt else None,
+                "put": opt.put_oi_change if opt else None,
             },
             "news_blackout": news_blackout,
             "active_blackouts": active_blackouts,
-            "nearest_expiry": options_ctx.nearest_expiry,
-            "bias": options_analyzer.get_bias(options_ctx)
+            "nearest_expiry": opt.nearest_expiry if opt else None,
+            "bias": options_analyzer.get_bias(opt),
         }
     
     def _higher_timeframe_filter(self) -> Direction:

@@ -22,7 +22,7 @@ CLOSE_TICK = datetime(2026, 10, 26, 4, 45)
 
 
 def long_setup() -> Candle:
-    """A closed 15m candle the engine scores LONG 80: stop 23991, T1 24020."""
+    """A closed 15m candle the engine scores LONG 75: stop 23991, T1 24020."""
     return Candle(
         timestamp=BAR, open=23995, high=24001, low=23999, close=24000, volume=0,
         ema_20=23990, ema_50=23980, ema_200=23900, vwap=23950, rsi=55,
@@ -203,11 +203,11 @@ async def test_a_trade_runs_through_all_its_exits():
     result = await simulate(rep, Variant(), exact())
     [record] = result.trades
     t = record.trade
-    # ₹1,000 risk x (0.5 + 0.8 confidence) / 9 points = 144 units.
-    assert (t.entry_price, t.initial_qty, t.stop_loss) == (24000, 144, 23991)
-    assert (t.exit_t1_qty, t.exit_t2_qty) == (72, 54)
+    # ₹1,000 risk x (0.5 + 0.5 x 0.75 confidence) / 9 points = 97 units.
+    assert (t.entry_price, t.initial_qty, t.stop_loss) == (24000, 97, 23991)
+    assert (t.exit_t1_qty, t.exit_t2_qty) == (48, 36)
     assert record.exit_reason == "STOP_LOSS" and t.exit_price == 23990
-    assert record.gross == 72 * 20 + 54 * 30 - 18 * 10
+    assert record.gross == 48 * 20 + 36 * 30 - 13 * 10
     assert record.charges == 0
 
 
@@ -221,7 +221,7 @@ async def test_charges_and_slippage_are_paid_on_every_fill():
     t = record.trade
     assert t.entry_price == 24002.4  # bought above the price
     assert t.exit_t1_price == 24017.6  # sold below T1
-    orders = [(1, 24002.4, 144), (-1, 24017.6, 72), (-1, 24027.6, 54), (-1, 24037.6, 18)]
+    orders = [(1, 24002.4, 97), (-1, 24017.6, 48), (-1, 24027.6, 36), (-1, 24037.6, 13)]
     assert record.exit_reason == "TARGET_3"
     assert record.charges == pytest.approx(sum(FUTURES.order_cost(*o) for o in orders))
     assert record.net == pytest.approx(record.gross - record.charges)
@@ -230,7 +230,7 @@ async def test_charges_and_slippage_are_paid_on_every_fill():
 async def test_an_open_trade_is_closed_at_the_end_of_the_data():
     rep = Replay(path(24000, 24005), [decision(long_setup())])
     [record] = (await simulate(rep, Variant(), exact())).trades
-    assert record.exit_reason == "END_OF_DATA" and record.gross == 144 * 5
+    assert record.exit_reason == "END_OF_DATA" and record.gross == 97 * 5
 
 
 async def test_the_live_risk_rules_apply():

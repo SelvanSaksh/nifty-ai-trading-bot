@@ -69,7 +69,7 @@ async def list_tools():
             },
             {
                 "name": "get_market_context",
-                "description": "Options PCR, OI shifts, VIX regime",
+                "description": "News blackout state, plus options PCR, OI and VIX when options data is connected (options_available=false: those fields are null)",
                 "parameters": {},
                 "read_only": True
             },

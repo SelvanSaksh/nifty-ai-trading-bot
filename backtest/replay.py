@@ -18,9 +18,9 @@ from utils.live_bars import in_session
 #: Neutral market context. The decision engine does not score it, and the
 #: live values (options chain, news) have no history to replay.
 OFFLINE_CONTEXT: Dict[str, Any] = {
-    "pcr": None, "vix_regime": "normal", "max_pain": None, "call_oi": 0,
-    "put_oi": 0, "oi_change": {"call": 0, "put": 0}, "news_blackout": False,
-    "active_blackouts": [], "nearest_expiry": None, "bias": "neutral",
+    "options_available": False, "pcr": None, "vix_regime": None, "max_pain": None,
+    "call_oi": None, "put_oi": None, "oi_change": {"call": None, "put": None},
+    "news_blackout": False, "active_blackouts": [], "nearest_expiry": None, "bias": None,
 }
 
 

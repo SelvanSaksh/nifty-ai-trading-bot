@@ -203,13 +203,16 @@ class RiskManager:
     def calculate_position_size(self, signal: Signal, current_price: float, lot_size: int = 1) -> int:
         """Risk-based position sizing, in whole lots of ``lot_size``.
 
+        Never risks more than ``RISK_PER_TRADE`` of capital: confidence
+        scales the risk between 50% and 100% of it (it used to reach 150%).
         Returns 0 when even one lot would risk more than the allowed amount:
         the trade is skipped rather than taken over-sized.
         """
         risk_amount = settings.CAPITAL * settings.RISK_PER_TRADE
 
-        # Scale by confidence (50-150%)
-        confidence_multiplier = 0.5 + signal.confidence  # 0.5 to 1.5
+        # Scale by confidence: 0.0 -> 50%, 1.0 -> 100% of the allowed risk.
+        confidence = min(1.0, max(0.0, signal.confidence))
+        confidence_multiplier = 0.5 + 0.5 * confidence
 
         # Scale by VIX regime (halved in extreme)
         # TODO: integrate with features/options.py vix_multiplier

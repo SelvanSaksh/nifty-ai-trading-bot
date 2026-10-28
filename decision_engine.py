@@ -110,10 +110,9 @@ class DecisionEngine:
         if candle.macd_hist and candle.macd_hist > 0:
             score += 10
         
-        # Volume (max 10)
-        # Simplified: would compare to 20-bar average
-        score += 5  # Placeholder
-        
+        # Volume: no score. A flat +5 used to be added to every signal; a
+        # real volume rule has to earn its place in a backtest first.
+
         # Candlestick patterns (max 15)
         for p in patterns:
             if p in BULLISH_PATTERNS:
@@ -162,9 +161,8 @@ class DecisionEngine:
         if candle.macd_hist and candle.macd_hist < 0:
             score += 10
         
-        # Volume (max 10)
-        score += 5
-        
+        # Volume: no score (see _score_long).
+
         # Patterns (max 15)
         for p in patterns:
             if p in BEARISH_PATTERNS:

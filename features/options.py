@@ -51,38 +51,16 @@ class OptionsAnalyzer:
         self._cache_time: Optional[datetime] = None
         self._cache_ttl = timedelta(minutes=5)
     
-    async def get_context(self) -> OptionsContext:
-        """Get options context (cached for 5 minutes)."""
-        if self._cache and self._cache_time:
-            if datetime.now() - self._cache_time < self._cache_ttl:
-                return self._cache
-        
-        context = await self._fetch_options_data()
-        self._cache = context
-        self._cache_time = datetime.now()
-        return context
-    
-    async def _fetch_options_data(self) -> OptionsContext:
+    async def get_context(self) -> Optional[OptionsContext]:
+        """The options context, or None while no data source is connected.
+
+        There is no options feed yet: this used to return hard-coded numbers
+        (PCR 1.15, max pain 24,500, VIX 16.5) that the dashboard and the MCP
+        tool showed as if they were live. None makes every consumer say
+        "not available" instead. Connect the Fyers option chain here.
         """
-        Fetch options chain from Fyers API.
-        In production, this calls Fyers option chain endpoint.
-        """
-        # Placeholder: In production, use Fyers option_chain API
-        # fyers.option_chain(data={"symbol": "NSE:NIFTY50-INDEX", "strikecount": 10})
-        
-        # Simulated data for structure demonstration
-        return OptionsContext(
-            pcr=1.15,
-            max_pain_strike=24500.0,
-            max_pain_value=1250000.0,
-            call_oi_total=4500000,
-            put_oi_total=5200000,
-            call_oi_change=125000,
-            put_oi_change=180000,
-            vix_regime=self._classify_vix(16.5),
-            nearest_expiry=self._get_nearest_expiry()
-        )
-    
+        return None
+
     def _classify_vix(self, vix_value: float) -> str:
         """Classify India VIX into regime."""
         if vix_value < self.VIX_THRESHOLDS["low"]:
@@ -94,19 +72,13 @@ class OptionsAnalyzer:
         else:
             return "extreme"
     
-    def _get_nearest_expiry(self) -> str:
-        """Get nearest weekly/monthly expiry date."""
-        today = datetime.now()
-        # Nifty weekly expiry is every Thursday
-        days_until_thursday = (3 - today.weekday()) % 7
-        nearest = today + timedelta(days=days_until_thursday)
-        return nearest.strftime("%Y-%m-%d")
-    
-    def get_size_multiplier(self, context: OptionsContext) -> float:
+    def get_size_multiplier(self, context: Optional[OptionsContext]) -> float:
         """
         Reduce position size in extreme VIX conditions.
-        Halved in extreme VIX as per documentation.
+        Halved in extreme VIX as per documentation. 1.0 without options data.
         """
+        if context is None:
+            return 1.0
         multipliers = {
             "low": 1.2,
             "normal": 1.0,
@@ -115,8 +87,10 @@ class OptionsAnalyzer:
         }
         return multipliers.get(context.vix_regime, 1.0)
     
-    def get_bias(self, context: OptionsContext) -> str:
-        """Determine market bias from PCR."""
+    def get_bias(self, context: Optional[OptionsContext]) -> Optional[str]:
+        """Determine market bias from PCR (None without options data)."""
+        if context is None:
+            return None
         if context.pcr > 1.3:
             return "extreme_bearish"  # Too many puts = contrarian bullish
         elif context.pcr > 1.0:

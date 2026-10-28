@@ -24,7 +24,9 @@ SQUARE_OFF_UTC = datetime(2026, 10, 26, 9, 45)
 EQ = "NSE:SBIN-EQ"
 
 
-def make_signal(direction=Direction.LONG, stop=790.0, t1=820.0, t2=830.0, t3=840.0, confidence=0.5):
+# Confidence 1.0 sizes at the full RISK_PER_TRADE (₹1,000): the trade
+# mechanics below are written for that size.
+def make_signal(direction=Direction.LONG, stop=790.0, t1=820.0, t2=830.0, t3=840.0, confidence=1.0):
     return Signal(
         timestamp=T0, direction=direction, score=80, confidence=confidence,
         reasoning="test", stop_loss=stop, target_1=t1, target_2=t2, target_3=t3,
@@ -137,6 +139,24 @@ class TestSizing:
     def test_whole_lots_only(self):
         signal = make_signal(stop=24495.0)  # 5 points of risk -> 200 units
         assert RiskManager().calculate_position_size(signal, 24500.0, 75) == 150
+
+    @pytest.mark.parametrize("confidence, qty", [
+        (0.0, 50),    # 50% of ₹1,000
+        (0.55, 77),   # a score-55 signal: 77.5% -> ₹775 / ₹10
+        (1.0, 100),   # the full ₹1,000, never more
+        (1.7, 100),   # out-of-range confidence is clamped
+        (-0.3, 50),
+    ])
+    def test_confidence_scales_within_the_risk_limit(self, confidence, qty):
+        signal = make_signal(confidence=confidence)
+        assert RiskManager().calculate_position_size(signal, 800.0, 1) == qty
+
+    def test_risk_never_exceeds_risk_per_trade(self):
+        allowed = settings.CAPITAL * settings.RISK_PER_TRADE
+        for step in range(0, 101):
+            signal = make_signal(confidence=step / 100)
+            qty = RiskManager().calculate_position_size(signal, 800.0, 1)
+            assert qty * (800.0 - signal.stop_loss) <= allowed, step / 100
 
     def test_no_trade_when_one_lot_risks_too_much(self):
         signal = make_signal(stop=24440.0)  # 60 points x 50 = ₹3,000 > ₹1,000

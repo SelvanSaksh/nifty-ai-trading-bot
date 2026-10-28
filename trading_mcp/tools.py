@@ -143,7 +143,7 @@ class MCPTools:
     
     # ── Tool 6: get_market_context ──────────────────────────────
     async def get_market_context(self) -> Dict[str, Any]:
-        """Options PCR, OI shifts, VIX regime."""
+        """News blackout state; options PCR/OI/VIX only when options_available."""
         if not self.bot_instance:
             return {"error": "Bot not initialized"}
         

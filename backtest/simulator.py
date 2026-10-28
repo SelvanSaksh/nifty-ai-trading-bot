@@ -13,7 +13,7 @@ what a real market order would get.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional
 
 import trade_rules
 from backtest.costs import CostModel, Slippage, preset_for
@@ -27,7 +27,7 @@ from utils.helpers import round_to_tick
 from utils.market_time import to_ist
 
 #: Scoring ingredients that can be switched off one at a time (ablation).
-COMPONENTS = ("trend", "vwap", "rsi", "macd", "volume", "patterns", "advanced", "ht_filter")
+COMPONENTS = ("trend", "vwap", "rsi", "macd", "patterns", "advanced", "ht_filter")
 
 
 class BacktestRiskManager(RiskManager):
@@ -90,10 +90,10 @@ class Result:
     skipped: Dict[str, int] = field(default_factory=dict)
 
 
-def _apply_variant(point: DecisionPoint, variant: Variant) -> Tuple[dict, int]:
-    """The analysis as the variant sees it, and the score threshold shift."""
+def _apply_variant(point: DecisionPoint, variant: Variant) -> dict:
+    """The analysis as the variant sees it."""
     if not variant.disabled:
-        return point.analysis, 0
+        return point.analysis
     analysis = dict(point.analysis)
     candle = analysis["candle"].model_copy()
     off = variant.disabled
@@ -112,9 +112,7 @@ def _apply_variant(point: DecisionPoint, variant: Variant) -> Tuple[dict, int]:
     if "ht_filter" in off:
         analysis["higher_timeframe_trend"] = Direction.WAIT
     analysis["candle"] = candle
-    # The volume score is a constant +5 on both sides: dropping it is the
-    # same as needing 5 more points.
-    return analysis, (5 if "volume" in off else 0)
+    return analysis
 
 
 class _Sim:
@@ -173,10 +171,8 @@ class _Sim:
         if not can_trade:
             self._skip(reason.split(":")[0].split(" (")[0])
             return
-        analysis, threshold_shift = _apply_variant(point, self.variant)
-        engine = DecisionEngine()
-        engine.min_threshold += threshold_shift
-        signal = engine.evaluate(analysis)
+        analysis = _apply_variant(point, self.variant)
+        signal = DecisionEngine().evaluate(analysis)
         if signal.direction != Direction.WAIT:
             self.result.signals += 1
         valid, _ = self.risk.validate_signal(signal)

@@ -4,7 +4,8 @@ Prevents trading during high-impact news events.
 """
 import aiohttp
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 import re
@@ -12,18 +13,25 @@ import re
 from config import settings
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 @dataclass
 class NewsEvent:
     title: str
     source: str
-    published: datetime
-    impact: str        
+    published: datetime  # timezone-aware, UTC
+    impact: str
     keywords: List[str]
-    
+
     def is_blackout(self, now: datetime = None, blackout_minutes: int = 15) -> bool:
-        """Check if current time falls within blackout window."""
+        """Check if current time falls within blackout window.
+
+        ``now`` must be timezone-aware (default: the current UTC time).
+        """
         if now is None:
-            now = datetime.now()
+            now = utc_now()
         window_start = self.published - timedelta(minutes=blackout_minutes)
         window_end = self.published + timedelta(minutes=blackout_minutes)
         return window_start <= now <= window_end
@@ -32,11 +40,19 @@ class NewsEvent:
 class NewsMonitor:
     """Monitors financial news for trading blackouts."""
     
+    # Matched as whole words, ignoring case ("war" is not "software", "fed"
+    # is not "Fedbank"). Words that describe the market itself ("nifty",
+    # "rally", "crash") are not events: they appear in routine market
+    # headlines all day and would block every trade.
     HIGH_IMPACT_KEYWORDS = [
         "RBI", "repo rate", "monetary policy", "GDP", "inflation",
         "CPI", "WPI", "IIP", "trade deficit", "budget", "union budget",
         "election results", "PMI", "crude oil", "geopolitical",
-        "war", "sanctions", "fed", "fomc", "nifty", "crash", "rally"
+        "war", "sanctions", "fed", "fomc",
+    ]
+    _KEYWORD_PATTERNS = [
+        (kw, re.compile(rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])", re.IGNORECASE))
+        for kw in HIGH_IMPACT_KEYWORDS
     ]
     
     RSS_FEEDS = [
@@ -55,7 +71,7 @@ class NewsMonitor:
         if not self._last_fetch or (datetime.now() - self._last_fetch) > timedelta(minutes=5):
             await self._fetch_news()
         
-        now = datetime.now()
+        now = utc_now()
         for event in self._events:
             if event.impact == "high" and event.is_blackout(now, settings.NEWS_BLACKOUT_MINUTES):
                 return True
@@ -63,7 +79,7 @@ class NewsMonitor:
     
     async def get_active_blackouts(self) -> List[Dict[str, Any]]:
         """Get list of currently active blackout events."""
-        now = datetime.now()
+        now = utc_now()
         active = []
         for event in self._events:
             if event.impact == "high" and event.is_blackout(now, settings.NEWS_BLACKOUT_MINUTES):
@@ -112,7 +128,14 @@ class NewsMonitor:
                     continue
                 
                 title = title_elem.text or ""
-                pub_date = self._parse_date(pub_date_elem.text if pub_date_elem else "")
+                # `is not None`: an element without children is falsy, so a
+                # truthiness test dropped every date.
+                pub_date = self._parse_date(
+                    pub_date_elem.text if pub_date_elem is not None else None
+                )
+                if pub_date is None:
+                    # No usable time: the item cannot be placed in a window.
+                    continue
                 source = source_elem.text if source_elem is not None else "Unknown"
                 
                 # Determine impact
@@ -129,26 +152,40 @@ class NewsMonitor:
         except ET.ParseError:
             pass
     
-    def _parse_date(self, date_str: str) -> datetime:
-        """Parse various RSS date formats."""
-        formats = [
-            "%a, %d %b %Y %H:%M:%S %z",
-            "%a, %d %b %Y %H:%M:%S GMT",
-            "%Y-%m-%dT%H:%M:%S%z",
-        ]
-        for fmt in formats:
+    def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
+        """An RSS date (RFC 2822, or ISO 8601 with an offset) as aware UTC.
+
+        None when it is missing, malformed or has no timezone: guessing a
+        time (it used to fall back to "now") puts stale headlines into the
+        blackout window.
+        """
+        text = (date_str or "").strip()
+        if not text:
+            return None
+        parsed = None
+        try:
+            parsed = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
             try:
-                return datetime.strptime(date_str, fmt)
-            except (ValueError, TypeError):
-                continue
-        return datetime.now()
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            # RFC 2822 "-0000" means UTC with an unknown local zone; an ISO
+            # time without an offset is ambiguous.
+            if "-0000" not in text:
+                return None
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     
     def _classify_impact(self, title: str) -> str:
         """Classify news impact based on keywords."""
         title_lower = title.lower()
-        
-        high_impact = any(kw.lower() in title_lower for kw in self.HIGH_IMPACT_KEYWORDS)
-        
+
+        high_impact = any(pattern.search(title) for _, pattern in self._KEYWORD_PATTERNS)
+
         if high_impact:
             return "high"
         
@@ -160,12 +197,7 @@ class NewsMonitor:
     
     def _extract_keywords(self, title: str) -> List[str]:
         """Extract relevant keywords from title."""
-        found = []
-        title_lower = title.lower()
-        for kw in self.HIGH_IMPACT_KEYWORDS:
-            if kw.lower() in title_lower:
-                found.append(kw)
-        return found
+        return [kw for kw, pattern in self._KEYWORD_PATTERNS if pattern.search(title)]
 
 
 news_monitor = NewsMonitor()

@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import List
 from models.candle import Candle
+from utils.market_time import to_ist
 
 def rsi(closes: List[float], period: int = 14) -> float:
     """Relative Strength Index."""
@@ -62,10 +63,18 @@ def atr(candles: List[Candle], period: int = 14) -> float:
     return np.mean(tr_list[-period:])
 
 def vwap(candles: List[Candle]) -> float:
-    """Volume Weighted Average Price (session-based)."""
+    """Session VWAP: from the first candle of the newest candle's IST trading
+    day (candle times are naive UTC). It used to run over the whole buffer,
+    across days, which is not VWAP. ``candles`` is oldest first."""
     if not candles:
         return 0.0
-    
+
+    session_day = to_ist(candles[-1].timestamp).date()
+    start = len(candles) - 1
+    while start > 0 and to_ist(candles[start - 1].timestamp).date() == session_day:
+        start -= 1
+    candles = candles[start:]
+
     typical_prices = [(c.high + c.low + c.close) / 3 for c in candles]
     volumes = [c.volume for c in candles]
     
