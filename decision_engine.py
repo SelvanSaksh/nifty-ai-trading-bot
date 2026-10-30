@@ -64,7 +64,10 @@ class DecisionEngine:
         reasoning = self._build_reasoning(direction, score, analysis)
         
         return Signal(
-            timestamp=datetime.now(),
+            # Naive UTC, like every time the API serves (the chart places
+            # its signal markers by it).
+            timestamp=datetime.utcnow(),
+            price=candle.close,
             direction=direction,
             score=score,
             confidence=confidence,
@@ -181,7 +184,8 @@ class DecisionEngine:
     
     def _wait_signal(self, candle, reason: str = "Score below threshold") -> Signal:
         return Signal(
-            timestamp=datetime.now(),
+            timestamp=datetime.utcnow(),
+            price=candle.close,
             direction=Direction.WAIT,
             score=0,
             confidence=0.0,

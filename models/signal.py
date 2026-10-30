@@ -1,9 +1,10 @@
 from pydantic import BaseModel
+from typing import Optional
 from datetime import datetime
 from models.enums import Direction
 
 class Signal(BaseModel):
-    timestamp: datetime
+    timestamp: datetime           # naive UTC
     direction: Direction
     score: int                    # 0-100
     confidence: float             # 0.0-1.0
@@ -22,6 +23,8 @@ class Signal(BaseModel):
     target_2: float
     target_3: float
     risk_reward: float
+    # Close of the candle the signal was evaluated on (None: older records).
+    price: Optional[float] = None
     
     ht_filter_passed: bool = True
 

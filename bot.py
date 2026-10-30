@@ -1087,7 +1087,24 @@ class NiftyBot:
         signal: Optional[Signal] = None,
         scores: Optional[Tuple[int, int]] = None,
     ):
-        """Store and broadcast what this candle close led to, and why."""
+        """Store and broadcast what this candle close led to, and why.
+
+        Never raises: the record is informational, and the cycle it reports
+        on has already acted.
+        """
+        try:
+            await self._save_and_broadcast_decision(candle, outcome, reason, signal, scores)
+        except Exception as exc:
+            print(f"[BOT] Decision not recorded ({outcome}): {exc}")
+
+    async def _save_and_broadcast_decision(
+        self,
+        candle: Candle,
+        outcome: str,
+        reason: str,
+        signal: Optional[Signal],
+        scores: Optional[Tuple[int, int]],
+    ):
         decision = await save_decision({
             "candle_time": candle.timestamp.isoformat(),
             "recorded_at": datetime.utcnow().isoformat(),
@@ -1679,8 +1696,8 @@ class NiftyBot:
     async def get_recent_trades(self, limit: int = 20):
         return await get_recent_trades(limit)
     
-    async def get_recent_signals(self, limit: int = 20):
-        return await get_recent_signals(limit)
+    async def get_recent_signals(self, limit: int = 20, include_wait: bool = True):
+        return await get_recent_signals(limit, include_wait)
     
     async def get_market_context(self):
         # NOW WITH await

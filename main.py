@@ -296,8 +296,10 @@ async def get_trade(trade_id: str):
 # ── Signals ─────────────────────────────────────────────────────
 
 @app.get("/api/signals")
-async def get_recent_signals(limit: int = 20):
-    return await app.state.bot.get_recent_signals(limit)
+async def get_recent_signals(limit: int = 20, include_wait: bool = True):
+    """Newest first. ``include_wait=false``: LONG/SHORT signals only."""
+    limit = max(1, min(limit, 200))
+    return await app.state.bot.get_recent_signals(limit, include_wait)
 
 
 # ── Candles ─────────────────────────────────────────────────────

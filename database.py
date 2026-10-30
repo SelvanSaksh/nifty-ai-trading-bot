@@ -88,7 +88,8 @@ async def init_db():
                 stop_loss REAL, target_1 REAL, target_2 REAL, target_3 REAL,
                 risk_reward REAL, ht_filter_passed INTEGER,
                 symbol TEXT NOT NULL DEFAULT '',
-                symbol_name TEXT NOT NULL DEFAULT ''
+                symbol_name TEXT NOT NULL DEFAULT '',
+                price REAL
             )
         """)
 
@@ -164,6 +165,7 @@ async def init_db():
         await _add_missing_columns(db, "signals", {
             "symbol": "TEXT NOT NULL DEFAULT ''",
             "symbol_name": "TEXT NOT NULL DEFAULT ''",
+            "price": "REAL",
         })
         await _add_missing_columns(db, "trades", {
             "symbol": "TEXT NOT NULL DEFAULT ''",
@@ -329,15 +331,15 @@ async def save_signal(signal: Signal, symbol: str = "", symbol_name: str = ""):
             INSERT INTO signals (
                 timestamp, direction, score, confidence, reasoning,
                 stop_loss, target_1, target_2, target_3,
-                risk_reward, ht_filter_passed, symbol, symbol_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                risk_reward, ht_filter_passed, symbol, symbol_name, price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.timestamp.isoformat(), signal.direction.value, signal.score,
                 signal.confidence, signal.reasoning,
                 signal.stop_loss, signal.target_1, signal.target_2, signal.target_3,
                 signal.risk_reward, int(signal.ht_filter_passed),
-                symbol, symbol_name,
+                symbol, symbol_name, signal.price,
             ),
         )
 
@@ -417,10 +419,13 @@ async def get_recent_trades(limit: int = 20) -> List[Trade]:
         return [_row_to_trade(row) for row in rows]
 
 
-async def get_recent_signals(limit: int = 20) -> List[Signal]:
+async def get_recent_signals(limit: int = 20, include_wait: bool = True) -> List[Signal]:
+    """Newest first. ``include_wait=False`` keeps only LONG/SHORT signals
+    (a WAIT is stored at every decision cycle without a setup)."""
+    where = "" if include_wait else "WHERE direction != 'WAIT' "
     async with _db() as db:
         cursor = await db.execute(
-            "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
+            f"SELECT * FROM signals {where}ORDER BY timestamp DESC LIMIT ?", (limit,)
         )
         rows = await cursor.fetchall()
         signals: List[Signal] = []
@@ -439,6 +444,7 @@ async def get_recent_signals(limit: int = 20) -> List[Signal]:
                 ht_filter_passed=bool(row["ht_filter_passed"]),
                 symbol=row["symbol"] if "symbol" in row.keys() else "",
                 symbol_name=row["symbol_name"] if "symbol_name" in row.keys() else "",
+                price=row["price"] if "price" in row.keys() else None,
             )
             signals.append(signal)
         return signals
