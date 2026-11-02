@@ -1022,7 +1022,10 @@ class NiftyBot:
         # Check if trading allowed — NOW WITH await
         can_trade, reason = await self.risk_manager.can_trade()
         if not can_trade:
-            await self._record_decision(candle, "BLOCKED", reason)
+            # Scored anyway, so the timeline shows what the gate held back.
+            await self._record_decision(
+                candle, "BLOCKED", reason, scores=await self._scores_while_blocked(candle)
+            )
             await self._broadcast({
                 "type": "skip",
                 "reason": reason,
@@ -1078,6 +1081,19 @@ class NiftyBot:
             "reason": validation_reason,
             "signal_score": signal.score
         })
+
+    async def _scores_while_blocked(self, candle: Candle) -> Optional[Tuple[int, int]]:
+        """(long, short) scores of a candle the risk gate blocked, or None if
+        it cannot be analysed. Nothing else is done with them."""
+        try:
+            analysis = await self.analyzer.analyze(candle)
+            return (
+                self.decision_engine._score_long(analysis),
+                self.decision_engine._score_short(analysis),
+            )
+        except Exception as exc:
+            print(f"[BOT] Blocked candle not scored: {exc}")
+            return None
 
     async def _record_decision(
         self,
@@ -1161,9 +1177,12 @@ class NiftyBot:
                 )
 
             lot = self.risk_manager.lot_size_for(self.symbol)
-            qty = self.risk_manager.calculate_position_size(signal, entry_price, lot)
+            sized = self.risk_manager.size_position(
+                signal, entry_price, lot, self.risk_manager.max_position_value(self.symbol)
+            )
+            qty = sized.qty
             if qty <= 0:
-                return "Position size 0: one lot would risk more than the per-trade limit"
+                return sized.why_zero()
 
             trade = Trade(
                 # Naive UTC, like every time the API serves.
@@ -1368,7 +1387,10 @@ class NiftyBot:
             if action.fraction is None:
                 await self._exit_trade(action.price, timestamp, action.reason)
             else:
-                await self._partial_exit(action.price, timestamp, action.new_status, action.fraction)
+                await self._partial_exit(
+                    action.price, timestamp, action.new_status, action.fraction,
+                    action.move_stop_to,
+                )
 
     async def _supervise_trade(self):
         """Checks that must not wait for a tick (the feed can fall silent):
@@ -1409,8 +1431,16 @@ class NiftyBot:
             await self._place_stop(trade, trade.remaining_qty)
             await save_trade(trade)
 
-    async def _partial_exit(self, price: float, timestamp: datetime, new_status: TradeStatus, fraction: float):
-        """Execute partial exit at target (in whole lots)."""
+    async def _partial_exit(
+        self,
+        price: float,
+        timestamp: datetime,
+        new_status: TradeStatus,
+        fraction: float,
+        move_stop_to: Optional[float] = None,
+    ):
+        """Execute partial exit at target (in whole lots), then move the stop
+        if the exit rules say so (breakeven after T1)."""
         trade = self.active_trade
         label = "T1" if new_status == TradeStatus.PARTIAL_1 else "T2"
         exit_qty = trade_rules.partial_qty(
@@ -1424,6 +1454,8 @@ class NiftyBot:
             await self.notifier.send(
                 f"🎯 {label} HIT at {price}; {trade.remaining_qty} is too small to split, holding it all"
             )
+            if move_stop_to is not None:
+                await self._move_stop(trade, move_stop_to)
             await self._broadcast({"type": "partial_exit", "trade": trade.model_dump()})
             return
 
@@ -1453,7 +1485,29 @@ class NiftyBot:
         await self.notifier.send(f"🎯 {label} HIT! Exited {exit_qty} at {price}. PnL: {pnl:.2f}")
 
         await save_trade(trade)
+        if move_stop_to is not None:
+            await self._move_stop(trade, move_stop_to)
         await self._broadcast({"type": "partial_exit", "trade": trade.model_dump()})
+
+    async def _move_stop(self, trade: Trade, stop: float):
+        """Move the open trade's stop to ``stop``. A live trade's stop moves
+        only once the broker's stop order has, so both trigger together."""
+        if not trade.paper_trade and trade.sl_order_id:
+            ok = await self.broker.modify_order(
+                trade.sl_order_id, qty=trade.remaining_qty, type=3, stopPrice=stop
+            )
+            if not ok:
+                await self.notifier.send(
+                    f"⚠️ {trade.id}: could not move the broker stop to {stop}; "
+                    f"it stays at {trade.stop_loss}"
+                )
+                return
+        # Without a broker stop order (paper, or a failed placement that
+        # _check_broker_stop retries) the new level is used from now on.
+        old = trade.stop_loss
+        trade.stop_loss = stop
+        await save_trade(trade)
+        await self.notifier.send(f"🛡️ {trade.id}: stop moved from {old} to {stop} (breakeven)")
 
     async def _exit_trade(self, price: float, timestamp: datetime, reason: str):
         """Close remaining position (stays open if the broker did not fill)."""

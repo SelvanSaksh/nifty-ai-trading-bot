@@ -72,6 +72,8 @@ async def test_a_blocked_cycle_records_the_gate_reason(bot):
     assert d["outcome"] == "BLOCKED"
     assert d["reason"] == "News blackout: RBI hikes repo rate..."
     assert d["direction"] is None and d["score"] is None
+    # Scored anyway: what the gate held back (LONG 60, SHORT 8).
+    assert (d["long_score"], d["short_score"]) == (60, 8)
     assert d["candle_time"] == CANDLE_TIME.isoformat()
     assert d["symbol"] == settings.TRADING_SYMBOL and d["timeframe"] == "15m"
     assert d["price"] == 24005
@@ -89,7 +91,7 @@ async def test_no_setup_records_both_scores(bot):
 
     [d] = await get_recent_decisions()
     assert d["outcome"] == "WAIT"
-    assert d["reason"] == "Score below threshold"
+    assert d["reason"] == "Score below threshold: long 60, short 8, needs 70"
     assert (d["direction"], d["score"]) == ("WAIT", 0)
     assert (d["long_score"], d["short_score"]) == (60, 8)
 

@@ -448,9 +448,42 @@ async def test_a_partial_exit_shrinks_the_stop_before_selling(live_bot):
     trade = live_bot.active_trade
     live_bot.broker.calls.clear()
     await live_bot._manage_trade(820.0, T0 + timedelta(minutes=5))
-    assert live_bot.broker.calls == [("modify", trade.sl_order_id, 50), ("market", -1, 50)]
+    # Shrink the stop, sell, then move what is left of it to breakeven.
+    assert live_bot.broker.calls == [
+        ("modify", trade.sl_order_id, 50), ("market", -1, 50), ("modify", trade.sl_order_id, 50),
+    ]
     assert (trade.remaining_qty, trade.status) == (50, TradeStatus.PARTIAL_1)
     assert live_bot.broker._orders[trade.sl_order_id]["qty"] == 50
+    assert live_bot.broker._orders[trade.sl_order_id]["stop_price"] == 800.0
+    assert trade.stop_loss == 800.0
+
+
+async def test_the_stop_stays_put_when_the_broker_will_not_move_it(live_bot):
+    await enter(live_bot)
+    trade = live_bot.active_trade
+    real_modify = live_bot.broker.modify_order
+
+    async def refuse_price_moves(order_id, **kwargs):
+        if kwargs.get("stopPrice") != 790.0:
+            return False
+        return await real_modify(order_id, **kwargs)
+
+    live_bot.broker.modify_order = refuse_price_moves
+    await live_bot._manage_trade(820.0, T0 + timedelta(minutes=5))
+    # The bot keeps the level the broker's stop is really at.
+    assert (trade.status, trade.stop_loss) == (TradeStatus.PARTIAL_1, 790.0)
+    assert live_bot.broker._orders[trade.sl_order_id]["stop_price"] == 790.0
+
+
+async def test_a_paper_trade_moves_its_stop_to_breakeven_after_t1(paper_bot):
+    await enter(paper_bot)
+    trade = paper_bot.active_trade
+    await paper_bot._manage_trade(820.0, T0 + timedelta(minutes=5))
+    assert (trade.status, trade.stop_loss) == (TradeStatus.PARTIAL_1, 800.0)
+    # Back at the entry: the rest is closed there, not at 790.
+    await paper_bot._manage_trade(800.0, T0 + timedelta(minutes=6))
+    assert paper_bot.active_trade is None
+    assert (trade.exit_reason, trade.exit_price) == ("STOP_LOSS", 800.0)
 
 
 async def test_a_full_exit_cancels_the_stop_before_selling(live_bot):

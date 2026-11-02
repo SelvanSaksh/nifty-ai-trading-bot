@@ -29,12 +29,12 @@ class Settings(BaseSettings):
     BROKER_MODE: str = "fyers"
     
     # ── Trading Configuration ───────────────────────────────────
-    TRADING_SYMBOL: str = "NSE:NIFTY50-INDEX"
+    TRADING_SYMBOL: str = "NSE:RELIANCE-EQ"
     # Market structure is computed from every candle since this date (IST),
     # never from a fixed number of recent candles: a fixed start keeps every
     # confirmed swing, BOS and CHoCH stable for good.
     STRUCTURE_START: str = "2026-01-01"
-    TRADING_SYMBOL_NAME: str = "Nifty 50"
+    TRADING_SYMBOL_NAME: str = "Reliance"
     PAPER_TRADING: bool = True
     CAPITAL: float = 100_000.0
     RISK_PER_TRADE: float = 0.01
@@ -47,6 +47,20 @@ class Settings(BaseSettings):
     # ── Signal Thresholds ───────────────────────────────────────
     MIN_SCORE_THRESHOLD: int = 55
     MIN_RISK_REWARD: float = 1.5
+
+    # ── Stop and targets (multiples of the decision candle's ATR) ─
+    # Both measured from the candle close the trade is sized at, so the
+    # reward:risk of a signal is TARGET_1_ATR / STOP_ATR (1.5) whatever the
+    # candle's shape. After T1 the stop moves to the entry price.
+    STOP_ATR: float = 1.0
+    TARGET_1_ATR: float = 1.5
+    TARGET_2_ATR: float = 2.5
+    TARGET_3_ATR: float = 3.5
+
+    # Largest equity (-EQ) position, as a multiple of CAPITAL: 1.0 buys no
+    # more shares than the capital pays for. Index paper trades simulate
+    # futures (margin) and are not capped.
+    MAX_POSITION_LEVERAGE: float = 1.0
     
     # ── Timeframes ──────────────────────────────────────────────
     PRIMARY_TIMEFRAME: str = "15"
@@ -107,6 +121,9 @@ def public_config() -> dict:
         "news_blackout_minutes": settings.NEWS_BLACKOUT_MINUTES,
         "min_score_threshold": settings.MIN_SCORE_THRESHOLD,
         "min_risk_reward": settings.MIN_RISK_REWARD,
+        "stop_atr": settings.STOP_ATR,
+        "target_atr": [settings.TARGET_1_ATR, settings.TARGET_2_ATR, settings.TARGET_3_ATR],
+        "max_position_leverage": settings.MAX_POSITION_LEVERAGE,
         "primary_timeframe": settings.PRIMARY_TIMEFRAME,
         "higher_timeframe": settings.HIGHER_TIMEFRAME,
         "trading_start_time": settings.TRADING_START_TIME,

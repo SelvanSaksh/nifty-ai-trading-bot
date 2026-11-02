@@ -475,6 +475,37 @@ async def save_decision(decision: Dict[str, Any]) -> Dict[str, Any]:
         return {"id": cursor.lastrowid, **{c: decision.get(c) for c in _DECISION_COLUMNS}}
 
 
+async def get_decision_summary(start: datetime, end: datetime, symbol: str) -> Dict[str, Any]:
+    """Decisions of ``symbol`` with ``start <= candle_time < end`` (naive
+    UTC): how many of each outcome, and the best long and short score (the
+    earliest candle on a tie), or None when no decision carried that score."""
+    bounds = (symbol, start.isoformat(), end.isoformat())
+    where = "WHERE symbol = ? AND candle_time >= ? AND candle_time < ?"
+    async with _db() as db:
+        cursor = await db.execute(
+            f"SELECT outcome, COUNT(*) AS n FROM decisions {where} GROUP BY outcome", bounds
+        )
+        counts = {row["outcome"]: row["n"] for row in await cursor.fetchall()}
+
+        async def best(column: str) -> Optional[Dict[str, Any]]:
+            cursor = await db.execute(
+                f"SELECT {column} AS score, candle_time, timeframe, outcome FROM decisions {where} "
+                f"AND {column} IS NOT NULL ORDER BY {column} DESC, candle_time ASC, id ASC LIMIT 1",
+                bounds,
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+        best_long = await best("long_score")
+        best_short = await best("short_score")
+    return {
+        "checks": sum(counts.values()),
+        "outcomes": {outcome: counts.get(outcome, 0) for outcome in DECISION_OUTCOMES},
+        "best_long": best_long,
+        "best_short": best_short,
+    }
+
+
 async def get_recent_decisions(limit: int = 50) -> List[Dict[str, Any]]:
     """Newest first."""
     async with _db() as db:

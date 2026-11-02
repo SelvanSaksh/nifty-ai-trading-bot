@@ -32,8 +32,18 @@ class DecisionEngine:
         elif short_score > long_score and short_score >= self.min_threshold:
             direction = Direction.SHORT
             score = short_score
+        elif long_score == short_score and long_score >= self.min_threshold:
+            return self._wait_signal(
+                candle, reason=f"Long and short tie at {long_score}: no clear direction"
+            )
         else:
-            return self._wait_signal(candle)
+            return self._wait_signal(
+                candle,
+                reason=(
+                    f"Score below threshold: long {long_score}, short {short_score}, "
+                    f"needs {self.min_threshold}"
+                ),
+            )
         
         # Higher timeframe veto
         if ht_filter != Direction.WAIT and ht_filter != direction:
@@ -42,18 +52,18 @@ class DecisionEngine:
                 reason=f"HT filter veto: {ht_filter.value} trend, signal was {direction.value}"
             )
         
-        # Calculate targets based on ATR
-        atr = candle.atr or 50
-        if direction == Direction.LONG:
-            stop_loss = candle.low - (0.8 * atr)
-            target_1 = candle.close + (2 * atr)
-            target_2 = candle.close + (3 * atr)
-            target_3 = candle.close + (4 * atr)
-        else:
-            stop_loss = candle.high + (0.8 * atr)
-            target_1 = candle.close - (2 * atr)
-            target_2 = candle.close - (3 * atr)
-            target_3 = candle.close - (4 * atr)
+        # Stop and targets: ATR multiples from the close the trade is sized
+        # at. No ATR yet (too little history) means no levels, so no trade.
+        atr = candle.atr
+        if not atr or atr <= 0:
+            return self._wait_signal(
+                candle, reason=f"{direction.value} {score}, but no ATR yet: stop and targets cannot be set"
+            )
+        side = 1 if direction == Direction.LONG else -1
+        stop_loss = candle.close - side * settings.STOP_ATR * atr
+        target_1 = candle.close + side * settings.TARGET_1_ATR * atr
+        target_2 = candle.close + side * settings.TARGET_2_ATR * atr
+        target_3 = candle.close + side * settings.TARGET_3_ATR * atr
         
         risk = abs(candle.close - stop_loss)
         reward = abs(target_1 - candle.close)

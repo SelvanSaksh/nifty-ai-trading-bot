@@ -54,7 +54,7 @@ class Variant:
 
 @dataclass
 class Settings:
-    symbol: str = "NSE:NIFTY50-INDEX"
+    symbol: str = settings.TRADING_SYMBOL
     capital: float = settings.CAPITAL
     lot_size: Optional[int] = None          # None: RiskManager.lot_size_for(symbol)
     costs: Optional[CostModel] = None       # None: preset_for(symbol)
@@ -183,7 +183,9 @@ class _Sim:
             return
 
         # NiftyBot._enter_trade: sized at the closed candle's price.
-        qty = self.risk.calculate_position_size(signal, point.candle.close, self.lot)
+        qty = self.risk.size_position(
+            signal, point.candle.close, self.lot, self.risk.max_position_value(self.config.symbol)
+        ).qty
         if qty <= 0:
             self._skip("Position size 0")
             return
@@ -220,6 +222,8 @@ class _Sim:
             else:
                 trade.exit_t2_price, trade.exit_t2_qty, trade.exit_t2_time = fill, qty, tick.time
         trade.status = action.new_status
+        if action.move_stop_to is not None:
+            trade.stop_loss = action.move_stop_to
 
     def _close(self, tick: Tick, price: float, reason: str):
         record = self.active

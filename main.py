@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Optional
 from urllib.parse import unquote
 from pydantic import BaseModel, Field
@@ -26,6 +26,7 @@ from bot import NiftyBot, SymbolConflictError, SymbolValidationError
 from database import (
     init_db,
     get_active_symbol_state,
+    get_decision_summary,
     get_recent_decisions,
     get_symbol_change_history,
 )
@@ -43,6 +44,7 @@ from fyers_auth import (
 from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError
 from utils.auth import require_admin_key
+from utils.market_time import IST, ist_now
 
 
 # Headers that let a client verify *which* instrument it is looking at.
@@ -270,6 +272,23 @@ async def get_decisions(limit: int = 50):
     """What each closed decision candle led to and why, newest first."""
     limit = max(1, min(limit, 200))
     return {"decisions": await get_recent_decisions(limit)}
+
+
+@app.get("/api/decisions/summary")
+async def get_decisions_summary():
+    """Today's (IST) decisions of the active symbol: how many of each
+    outcome, and the nearest misses (best long and short score) against the
+    score threshold."""
+    day = ist_now().date()
+    start = datetime.combine(day, time()) - IST.utcoffset(None)
+    symbol = (await get_active_symbol_state())["symbol"]
+    summary = await get_decision_summary(start, start + timedelta(days=1), symbol)
+    return {
+        "day": day.isoformat(),
+        "symbol": symbol,
+        "threshold": settings.MIN_SCORE_THRESHOLD,
+        **summary,
+    }
 
 
 @app.get("/api/stats")

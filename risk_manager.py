@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Any, Dict, Optional, Tuple
 from models.signal import Signal
@@ -10,6 +11,32 @@ from utils.market_time import ist_now, parse_hhmm
 
 #: app_state key the counters are saved under, so a restart cannot reset them.
 RISK_STATE_KEY = "risk_state"
+
+
+@dataclass(frozen=True)
+class PositionSize:
+    """A sizing result, with the numbers behind it."""
+    qty: int
+    lot: int
+    price: float
+    allowed_risk: float            # ₹ the trade may lose at its stop
+    risk_per_unit: float           # ₹ per unit between entry and stop
+    max_value: Optional[float]     # ₹ position-value cap (equities), else None
+
+    def why_zero(self) -> str:
+        """Why ``qty`` is 0, in numbers (call only when it is)."""
+        if self.risk_per_unit <= 0:
+            return "Position size 0: the stop is at the entry price"
+        unit = "share" if self.lot == 1 else f"lot of {self.lot}"
+        if self.max_value is not None and self.lot * self.price > self.max_value:
+            return (
+                f"Position size 0: one {unit} costs ₹{self.lot * self.price:,.0f}, "
+                f"more than the ₹{self.max_value:,.0f} position limit"
+            )
+        return (
+            f"Position size 0: one {unit} risks ₹{self.lot * self.risk_per_unit:,.0f} "
+            f"to the stop, more than the ₹{self.allowed_risk:,.0f} allowed"
+        )
 
 
 class RiskManager:
@@ -185,11 +212,13 @@ class RiskManager:
             return False, f"Score {signal.score} below threshold {settings.MIN_SCORE_THRESHOLD}"
 
         if signal.risk_reward < settings.MIN_RISK_REWARD:
-            return False, f"R:R {signal.risk_reward:.2f} below minimum {settings.MIN_RISK_REWARD}"
-
-        # Stop loss validation: reject stops tighter than 0.8×ATR
-        # (ATR reference would need to be passed in or stored)
-        # risk = abs(signal.stop_loss - signal.target_1) / signal.risk_reward
+            reason = f"R:R {signal.risk_reward:.2f} below minimum {settings.MIN_RISK_REWARD}"
+            if signal.price is not None:
+                reason += (
+                    f": stop {abs(signal.price - signal.stop_loss):,.2f} away, "
+                    f"target 1 {abs(signal.target_1 - signal.price):,.2f} away"
+                )
+            return False, reason
 
         return True, "Signal valid"
 
@@ -200,13 +229,33 @@ class RiskManager:
             return 1
         return max(1, int(settings.LOT_SIZE))
 
+    @staticmethod
+    def max_position_value(symbol: str) -> Optional[float]:
+        """₹ cap on a position's value: equities only (index paper trades
+        simulate futures, which trade on margin)."""
+        if symbol.endswith("-EQ"):
+            return settings.CAPITAL * settings.MAX_POSITION_LEVERAGE
+        return None
+
     def calculate_position_size(self, signal: Signal, current_price: float, lot_size: int = 1) -> int:
+        """Risk-based position sizing, in whole lots of ``lot_size`` (no
+        position-value cap; see ``size_position``)."""
+        return self.size_position(signal, current_price, lot_size).qty
+
+    def size_position(
+        self,
+        signal: Signal,
+        current_price: float,
+        lot_size: int = 1,
+        max_value: Optional[float] = None,
+    ) -> PositionSize:
         """Risk-based position sizing, in whole lots of ``lot_size``.
 
         Never risks more than ``RISK_PER_TRADE`` of capital: confidence
         scales the risk between 50% and 100% of it (it used to reach 150%).
-        Returns 0 when even one lot would risk more than the allowed amount:
-        the trade is skipped rather than taken over-sized.
+        ``max_value`` caps the position's value (₹). The size is 0 when even
+        one lot would risk more than the allowed amount, or cost more than
+        ``max_value``: the trade is skipped rather than taken over-sized.
         """
         risk_amount = settings.CAPITAL * settings.RISK_PER_TRADE
 
@@ -220,15 +269,21 @@ class RiskManager:
 
         adjusted_risk = risk_amount * confidence_multiplier * vix_multiplier
 
-        risk_per_unit = abs(current_price - signal.stop_loss)
-        if risk_per_unit <= 0:
-            return 0
-
         lot_size = max(1, int(lot_size))
+        risk_per_unit = abs(current_price - signal.stop_loss)
+
+        def size(qty: int) -> PositionSize:
+            return PositionSize(qty, lot_size, current_price, adjusted_risk, risk_per_unit, max_value)
+
+        if risk_per_unit <= 0:
+            return size(0)
+
         raw_qty = int(adjusted_risk / risk_per_unit)
+        if max_value is not None and current_price > 0:
+            raw_qty = min(raw_qty, int(max_value / current_price))
         lots = raw_qty // lot_size
 
-        return lots * lot_size
+        return size(lots * lot_size)
 
     def update_after_trade(self, trade: Trade, now: datetime = None):
         """Update risk counters after trade close (the caller saves).

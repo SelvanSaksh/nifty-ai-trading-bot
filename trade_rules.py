@@ -1,5 +1,6 @@
 """
-Exit rules of an open trade: square-off, stop-loss and the three targets.
+Exit rules of an open trade: square-off, stop-loss, the three targets and
+the move of the stop to breakeven after T1.
 
 Pure functions, shared by the live engine (bot.py) and the backtester, so a
 backtest manages trades exactly as the bot does.
@@ -11,6 +12,7 @@ from typing import Optional
 from config import settings
 from models.enums import Direction, TradeStatus
 from models.trade import Trade
+from utils.helpers import round_to_tick
 from utils.market_time import parse_hhmm, to_ist
 
 #: Share of the *initial* quantity taken off at T1 and T2. The rest rides to T3.
@@ -24,6 +26,7 @@ class ExitAction:
     price: float                   # price a paper fill is booked at
     fraction: Optional[float]      # partial exit (share of initial qty); None = all
     new_status: Optional[TradeStatus] = None  # status after a partial exit
+    move_stop_to: Optional[float] = None      # new stop once the partial is done
 
 
 def square_off_due(trade: Trade, now_utc: datetime) -> bool:
@@ -33,6 +36,15 @@ def square_off_due(trade: Trade, now_utc: datetime) -> bool:
         now.time() >= parse_hhmm(settings.SQUARE_OFF_TIME)
         or to_ist(trade.entry_time).date() < now.date()
     )
+
+
+def breakeven_stop(trade: Trade) -> Optional[float]:
+    """The entry price (on the price step) as the stop after T1, or None when
+    the current stop already protects at least that much."""
+    stop = round_to_tick(trade.entry_price)
+    if trade.direction == Direction.LONG:
+        return stop if stop > trade.stop_loss else None
+    return stop if stop < trade.stop_loss else None
 
 
 def _reached(trade: Trade, price: float, level: float) -> bool:
@@ -56,7 +68,11 @@ def next_exit(trade: Trade, price: float, now_utc: datetime) -> Optional[ExitAct
         return ExitAction("STOP_LOSS", price, None)
 
     if trade.status == TradeStatus.OPEN and _reached(trade, price, trade.target_1):
-        return ExitAction("TARGET_1", trade.target_1, T1_FRACTION, TradeStatus.PARTIAL_1)
+        # The rest of the position can no longer turn into a loss.
+        return ExitAction(
+            "TARGET_1", trade.target_1, T1_FRACTION, TradeStatus.PARTIAL_1,
+            move_stop_to=breakeven_stop(trade),
+        )
     if trade.status == TradeStatus.PARTIAL_1 and _reached(trade, price, trade.target_2):
         return ExitAction("TARGET_2", trade.target_2, T2_FRACTION, TradeStatus.PARTIAL_2)
     if trade.status == TradeStatus.PARTIAL_2 and _reached(trade, price, trade.target_3):
