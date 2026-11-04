@@ -497,6 +497,15 @@ async def get_symbol_history(limit: int = 20):
     return {"changes": await get_symbol_change_history(limit)}
 
 
+@app.get("/api/scanner")
+async def get_scanner():
+    """The watchlist ranked by what the decision engine makes of each
+    symbol's newest closed 15m candle. Scanned at every 15m close while the
+    engine runs; read-only (nothing is traded from here)."""
+    bot: NiftyBot = app.state.bot
+    return {**bot.scanner.snapshot(), "bot_running": bot.is_running}
+
+
 @app.get("/api/watchlist")
 async def get_watchlist():
     """Return all watchlist symbols with live quotes."""

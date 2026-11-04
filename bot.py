@@ -16,6 +16,7 @@ import trade_rules
 from analyzer import Analyzer
 from decision_engine import DecisionEngine
 from risk_manager import RiskManager
+from scanner import Scanner
 from database import (
     save_candle,
     save_decision,
@@ -131,6 +132,15 @@ class NiftyBot:
         self._engine_lock = SingletonFileLock(Path(settings.DB_PATH).parent / "engine.lock")
         self.engine_leader = False
         self._reconcile_task: Optional[asyncio.Task] = None
+        # Ranks the watchlist at every 15m close while the engine runs.
+        self.scanner = Scanner(
+            fetch_history=lambda symbol, tf, limit: self._fetch_history(
+                symbol, tf, limit, use_cache=False
+            ),
+            symbols=self._scan_symbols,
+            engine=self.decision_engine,
+        )
+        self._scan_task: Optional[asyncio.Task] = None
         self._pending_symbol_state: Optional[Dict[str, Any]] = None
         self._history_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # Forming candles of every subscribed symbol, from its ticks.
@@ -203,6 +213,7 @@ class NiftyBot:
             self.is_running = True
             self.start_time = datetime.utcnow()
             self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+            self._scan_task = asyncio.create_task(self.scanner.run())
         except BaseException:
             self.engine_leader = False
             self._engine_lock.release()
@@ -226,6 +237,13 @@ class NiftyBot:
             except asyncio.CancelledError:
                 pass
             self._reconcile_task = None
+        if self._scan_task is not None:
+            self._scan_task.cancel()
+            try:
+                await self._scan_task
+            except asyncio.CancelledError:
+                pass
+            self._scan_task = None
 
         self.is_running = False
 
@@ -304,6 +322,12 @@ class NiftyBot:
             raise SymbolValidationError(
                 f"'{symbol}' is not in the watchlist. Available: {available}"
             )
+
+    @staticmethod
+    def _scan_symbols() -> List[Tuple[str, str, str]]:
+        """Every symbol the bot can be switched to (the default watchlist)."""
+        default_wl = watchlist_manager.create_default("default")
+        return [(item.symbol, item.name, item.instrument_type) for item in default_wl.items]
 
     @staticmethod
     def _derive_symbol_name(symbol: str) -> str:

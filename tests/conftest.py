@@ -17,6 +17,19 @@ def _offline_news(monkeypatch):
     monkeypatch.setattr(settings, "BROKER_MODE", "mock")
 
 
+@pytest.fixture(autouse=True)
+def _no_background_scans(monkeypatch):
+    """The engine's watchlist scanner loop stays idle in tests (a scan of the
+    whole watchlist on the mock broker's random candles); tests call
+    ``Scanner.scan`` / ``scan_if_due`` directly."""
+    import asyncio
+
+    async def _idle(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("scanner.Scanner.run", _idle)
+
+
 TEST_ADMIN_KEY = "test-admin-key"
 
 
