@@ -30,6 +30,18 @@ def _no_background_scans(monkeypatch):
     monkeypatch.setattr("scanner.Scanner.run", _idle)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_login_lockout():
+    """Wrong-password lockouts are process-wide: start each test clean."""
+    from utils.auth import global_login_throttle, login_throttle
+
+    login_throttle.clear()
+    global_login_throttle.clear()
+    yield
+    login_throttle.clear()
+    global_login_throttle.clear()
+
+
 TEST_ADMIN_KEY = "test-admin-key"
 
 
@@ -41,7 +53,7 @@ def db_path(tmp_path, monkeypatch):
     path = tmp_path / "trades.db"
     monkeypatch.setattr(settings, "DB_PATH", str(path))
     # Mutating endpoints (bot start/stop/restart, symbol switch) require this
-    # header; give tests a known, non-default key so require_admin_key has
+    # header; give tests a known, non-default key so require_admin has
     # something real to check against.
     monkeypatch.setattr(settings, "ADMIN_SECRET_KEY", TEST_ADMIN_KEY)
     return path

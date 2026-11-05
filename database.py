@@ -160,6 +160,23 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_decisions_candle_time ON decisions (candle_time)"
         )
 
+        # Dashboard sign-in sessions. Only a hash of each token is stored, so
+        # a copy of the database cannot be used to sign in. ``credential``
+        # ties a session to the sign-in secret it was made with. A table
+        # from the short-lived password sign-in (it had a username) is
+        # replaced: that only signs its sessions out.
+        cursor = await db.execute("PRAGMA table_info(sessions)")
+        if any(row["name"] == "username" for row in await cursor.fetchall()):
+            await db.execute("DROP TABLE sessions")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                credential TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+        """)
+
         # Migrate pre-existing databases
         await _add_missing_columns(db, "candles", {"symbol": "TEXT NOT NULL DEFAULT ''"})
         await _add_missing_columns(db, "signals", {
@@ -516,3 +533,30 @@ async def get_recent_decisions(limit: int = 50) -> List[Dict[str, Any]]:
         )
         rows = await cursor.fetchall()
     return [dict(row) for row in rows]
+
+
+# ── Sign-in sessions ────────────────────────────────────────────
+
+async def create_session(
+    token_hash: str, credential: str, created_at: datetime, expires_at: datetime
+) -> None:
+    """Stores a new session and drops every expired one."""
+    async with _db() as db:
+        await db.execute("DELETE FROM sessions WHERE expires_at <= ?", (created_at.isoformat(),))
+        await db.execute(
+            "INSERT INTO sessions (token_hash, credential, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (token_hash, credential, created_at.isoformat(), expires_at.isoformat()),
+        )
+
+
+async def get_session(token_hash: str) -> Optional[Dict[str, Any]]:
+    async with _db() as db:
+        cursor = await db.execute("SELECT * FROM sessions WHERE token_hash = ?", (token_hash,))
+        row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def delete_session(token_hash: str) -> None:
+    async with _db() as db:
+        await db.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))

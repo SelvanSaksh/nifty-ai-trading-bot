@@ -12,7 +12,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -43,7 +43,15 @@ from fyers_auth import (
 )
 from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError
-from utils.auth import require_admin_key
+from utils.auth import (
+    DEFAULT_ADMIN_KEY,
+    bearer_token,
+    client_address,
+    login,
+    logout,
+    require_admin,
+    session_for,
+)
 from utils.market_time import IST, ist_now
 
 
@@ -64,11 +72,15 @@ async def lifespan(app: FastAPI):
     app.state.startup_error = None
     set_bot_instance(app.state.bot)  # Link to MCP server
 
-    if settings.ADMIN_SECRET_KEY == "change-me-in-production":
+    if not settings.ADMIN_PIN_HASH.strip():
         print(
-            "[BOOT] WARNING: ADMIN_SECRET_KEY is still the default value. "
-            "Bot start/stop/restart and symbol-switch endpoints are guarded by "
-            "this key — set a real secret in .env before deploying."
+            "[BOOT] WARNING: ADMIN_PIN_HASH is not set, so dashboard sign-in "
+            "is off. Set it up with: python -m utils.auth set-pin"
+        )
+    if settings.ADMIN_SECRET_KEY in ("", DEFAULT_ADMIN_KEY):
+        print(
+            "[BOOT] ADMIN_SECRET_KEY is unset or the default, so X-Admin-Key is "
+            "refused: only signed-in users can control the bot."
         )
 
     try:
@@ -234,6 +246,36 @@ async def fyers_auth_callback(request: Request):
 
 
 # ── Bot Status ──────────────────────────────────────────────────
+
+# ── Dashboard sign-in ───────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    pin: str = Field(max_length=16)
+
+
+@app.post("/api/session/login")
+async def session_login(body: LoginRequest, request: Request):
+    """The owner's 6-digit PIN -> a session token for the dashboard's
+    control calls (``Authorization: Bearer <token>``). See utils/auth.py."""
+    return await login(body.pin, client_address(request))
+
+
+@app.get("/api/session")
+async def session_info(authorization: str = Header(default="")):
+    """Until when the bearer token is signed in; 401 if it is not a live
+    session."""
+    session = await session_for(bearer_token(authorization))
+    if session is None:
+        raise HTTPException(status_code=401, detail="Not signed in")
+    return session
+
+
+@app.post("/api/session/logout")
+async def session_logout(authorization: str = Header(default="")):
+    """Ends the bearer token's session (fine if it already ended)."""
+    await logout(bearer_token(authorization))
+    return {"message": "Signed out"}
+
 
 @app.get("/api/status")
 async def get_status():
@@ -474,7 +516,7 @@ async def get_active_symbol():
     return await bot.get_symbol()
 
 
-@app.post("/api/symbols/active", dependencies=[Depends(require_admin_key)])
+@app.post("/api/symbols/active", dependencies=[Depends(require_admin)])
 async def set_active_symbol(request: SetActiveSymbolRequest):
     """Set the active trading symbol (persisted, versioned, audited)."""
     bot: NiftyBot = app.state.bot
@@ -515,7 +557,7 @@ async def get_watchlist():
 
 # ── Bot Control ─────────────────────────────────────────────────
 
-@app.post("/api/bot/start", dependencies=[Depends(require_admin_key)])
+@app.post("/api/bot/start", dependencies=[Depends(require_admin)])
 async def start_bot():
     bot: NiftyBot = app.state.bot
     if bot.is_running:
@@ -531,7 +573,7 @@ async def start_bot():
     return {"message": "Bot started", "uptime": bot.uptime, "symbol": bot.symbol}
 
 
-@app.post("/api/bot/stop", dependencies=[Depends(require_admin_key)])
+@app.post("/api/bot/stop", dependencies=[Depends(require_admin)])
 async def stop_bot():
     bot: NiftyBot = app.state.bot
     if not bot.is_running:
@@ -541,7 +583,7 @@ async def stop_bot():
     return {"message": "Bot stopped", "today_pnl": round(bot.today_pnl, 2)}
 
 
-@app.post("/api/bot/restart", dependencies=[Depends(require_admin_key)])
+@app.post("/api/bot/restart", dependencies=[Depends(require_admin)])
 async def restart_bot():
     bot: NiftyBot = app.state.bot
     if bot.is_running:

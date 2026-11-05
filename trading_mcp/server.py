@@ -5,7 +5,7 @@ Exposes 10 tools + in-app Claude assistant integration.
 from fastapi import FastAPI, Header
 
 from trading_mcp.tools import MCPTools
-from utils.auth import verify_admin_key
+from utils.auth import verify_admin
 
 mcp_app = FastAPI(title="Trading MCP Server")
 
@@ -105,10 +105,16 @@ async def list_tools():
 
 
 @mcp_app.post("/invoke/{tool_name}")
-async def invoke_tool(tool_name: str, params: dict = None, x_admin_key: str = Header(default="")):
-    """Invoke a specific MCP tool. State-changing tools require X-Admin-Key."""
+async def invoke_tool(
+    tool_name: str,
+    params: dict = None,
+    authorization: str = Header(default=""),
+    x_admin_key: str = Header(default=""),
+):
+    """Invoke a specific MCP tool. State-changing tools need X-Admin-Key or a
+    dashboard session (see utils/auth.py)."""
     if tool_name in STATE_CHANGING_TOOLS:
-        verify_admin_key(x_admin_key)
+        await verify_admin(authorization, x_admin_key)
     return await tools.invoke(tool_name, params)
 
 

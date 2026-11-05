@@ -91,8 +91,14 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     
     # ── Admin ───────────────────────────────────────────────────
+    # Shared key for scripts and the MCP client (X-Admin-Key). The default
+    # value is never accepted.
     ADMIN_SECRET_KEY: str = "change-me-in-production"
-    
+    # Dashboard sign-in with a 6-digit PIN, stored only as a salted hash
+    # from `python -m utils.auth set-pin`; unset, sign-in is off.
+    ADMIN_PIN_HASH: str = ""
+    SESSION_HOURS: int = 168
+
     # ── Logging ─────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

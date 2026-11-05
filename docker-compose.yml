@@ -42,6 +42,8 @@ services:
       
       # Admin
       - ADMIN_SECRET_KEY=${ADMIN_SECRET_KEY:-change-me-in-production}
+      - ADMIN_PIN_HASH=${ADMIN_PIN_HASH:-}
+      - SESSION_HOURS=${SESSION_HOURS:-168}
       
       # Logging
       - PYTHONUNBUFFERED=1
