@@ -10,6 +10,16 @@ from utils.market_structure import analyze_structure, closed_candles
 from features.options import options_analyzer
 from features.news import news_monitor
 
+#: Calendar days of 15m and 1h history the engine and the scanner analyze.
+#: An EMA starts from an SMA seed that fades by (1 - 2/(n+1)) per bar: 89
+#: days are ~1,500 15m bars (EMA 200 then depends on its seed by under 0.01%)
+#: and ~430 1h bars (EMA 50 by far less). It used to be 200 bars, which an
+#: EMA 200 cannot settle on. 89 days fit one Fyers history request (<= 100).
+WARMUP_DAYS = 89
+#: Timeframes the decision reads (EMA 20/50/200 and RSI on 15m, EMA 20/50 on 1h).
+WARMUP_TIMEFRAMES = ("15m", "1h")
+
+
 class Analyzer:
     """Computes the full analytical picture for each closed candle."""
     

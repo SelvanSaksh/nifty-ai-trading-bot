@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from analyzer import WARMUP_DAYS
 from backtest import data
 from backtest.costs import PRESETS, Slippage
 from backtest.replay import replay
@@ -37,8 +38,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--symbol", default=settings.TRADING_SYMBOL)
     p.add_argument("--from", dest="start", help="first IST day, YYYY-MM-DD")
     p.add_argument("--to", dest="end", help="last IST day, YYYY-MM-DD (default: today)")
-    p.add_argument("--warmup-days", type=int, default=10,
-                   help="calendar days replayed before trading starts, so indicators are ready (default 10)")
+    p.add_argument("--warmup-days", type=int, default=WARMUP_DAYS,
+                   help="calendar days replayed before trading starts, so indicators are ready "
+                        f"(default {WARMUP_DAYS}, the history the engine starts with)")
     p.add_argument("--capital", type=float, default=settings.CAPITAL)
     p.add_argument("--lot-size", type=int, default=None,
                    help="override the lot (default: 1 for -EQ, LOT_SIZE otherwise)")

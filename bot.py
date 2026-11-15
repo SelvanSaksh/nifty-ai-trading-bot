@@ -13,7 +13,7 @@ from brokers.fyers_broker import FyersBroker
 from brokers.fyers_broker_mock import FyersBroker as MockFyersBroker
 
 import trade_rules
-from analyzer import Analyzer
+from analyzer import WARMUP_DAYS, WARMUP_TIMEFRAMES, Analyzer
 from decision_engine import DecisionEngine
 from risk_manager import RiskManager
 from scanner import Scanner
@@ -134,9 +134,7 @@ class NiftyBot:
         self._reconcile_task: Optional[asyncio.Task] = None
         # Ranks the watchlist at every 15m close while the engine runs.
         self.scanner = Scanner(
-            fetch_history=lambda symbol, tf, limit: self._fetch_history(
-                symbol, tf, limit, use_cache=False
-            ),
+            fetch_history=self._fetch_warmup,
             symbols=self._scan_symbols,
             engine=self.decision_engine,
         )
@@ -581,15 +579,33 @@ class NiftyBot:
         bundle: Dict[str, List[Candle]] = {}
         for tf in ("5m", "15m", "1h"):
             try:
-                bundle[tf] = await self._fetch_history(
-                    symbol, tf, self.HISTORY_LIMIT, use_cache=False
-                )
+                if tf in WARMUP_TIMEFRAMES:
+                    bundle[tf] = await self._fetch_warmup(symbol, tf)
+                else:
+                    bundle[tf] = await self._fetch_history(
+                        symbol, tf, self.HISTORY_LIMIT, use_cache=False
+                    )
             except Exception as exc:
                 print(f"[BOT] Failed to load {tf} candles for {symbol}: {exc}")
                 bundle[tf] = []
         if not any(bundle.values()):
             raise RuntimeError(f"no history available for {symbol}")
         return bundle
+
+    async def _fetch_warmup(self, symbol: str, tf: str) -> List[Candle]:
+        """The last WARMUP_DAYS of ``tf`` candles, oldest first, for the
+        analyzer and the scanner: enough for EMA 200 to settle. Not cached
+        and separate from ``_fetch_history``, which serves the chart."""
+        end = datetime.utcnow()
+        raw = await self.broker.get_history_range(
+            symbol, RESOLUTION_BY_TIMEFRAME[tf], end - timedelta(days=WARMUP_DAYS), end
+        )
+        name = self._symbol_name_for(symbol)
+        for candle in raw:
+            candle.symbol = symbol
+            candle.symbol_name = name
+            candle.timeframe = tf
+        return sorted(raw, key=lambda c: c.timestamp)
 
     async def _fetch_history(
         self,

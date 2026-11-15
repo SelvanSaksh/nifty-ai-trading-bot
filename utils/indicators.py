@@ -1,51 +1,79 @@
 import numpy as np
 import pandas as pd
-from typing import List
+from typing import List, Optional, Tuple
 from models.candle import Candle
 from utils.market_time import to_ist
 
-def rsi(closes: List[float], period: int = 14) -> float:
-    """Relative Strength Index."""
-    if len(closes) < period + 1:
-        return 50.0
-    
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    
+def _smoothed_series(values: np.ndarray, period: int, alpha: float) -> np.ndarray:
+    """A recursive average seeded with the mean of the first ``period``
+    values, then avg = avg + alpha * (x - avg) for every later x. Element i
+    is the average through ``values[period - 1 + i]``."""
+    seeded = np.concatenate(([values[:period].mean()], values[period:]))
+    return pd.Series(seeded).ewm(alpha=alpha, adjust=False).mean().to_numpy()
+
+
+def _smoothed(values: np.ndarray, period: int, alpha: float) -> float:
+    """Last value of ``_smoothed_series``."""
+    return float(_smoothed_series(values, period, alpha)[-1])
+
+
+def rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    """Wilder's RSI, the standard one and the chart's
+    (trading_web_flutter lib/src/util/indicators.dart): average gain and loss
+    seeded with the mean of the first ``period`` changes, then smoothed by
+    Wilder's 1/period. None until ``period`` + 1 closes.
+
+    It used to average only the last ``period`` changes (Cutler's RSI) and
+    report 50 on short series, so it disagreed with the chart.
+    """
+    if period <= 0 or len(closes) <= period:
+        return None
+    deltas = np.diff(np.asarray(closes, dtype=float))
+    avg_gain = _smoothed(np.clip(deltas, 0, None), period, 1 / period)
+    avg_loss = _smoothed(np.clip(-deltas, 0, None), period, 1 / period)
     if avg_loss == 0:
-        return 100.0
-    
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+        return 50.0 if avg_gain == 0 else 100.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)
 
-def ema(closes: List[float], period: int) -> float:
-    """Exponential Moving Average."""
-    if len(closes) < period:
-        return closes[-1] if closes else 0.0
-    
-    weights = np.exp(np.linspace(-1., 0., period))
-    weights /= weights.sum()
-    return np.dot(closes[-period:], weights[::-1])
 
-def macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
-    """MACD line, signal line, histogram."""
-    if len(closes) < slow + signal:
-        return 0.0, 0.0, 0.0
-    
-    ema_fast = pd.Series(closes).ewm(span=fast, adjust=False).mean().iloc[-1]
-    ema_slow = pd.Series(closes).ewm(span=slow, adjust=False).mean().iloc[-1]
-    macd_line = ema_fast - ema_slow
-    
-    # Signal line (EMA of MACD)
-    macd_series = pd.Series(closes).ewm(span=fast).mean() - pd.Series(closes).ewm(span=slow).mean()
-    signal_line = macd_series.ewm(span=signal, adjust=False).mean().iloc[-1]
-    histogram = macd_line - signal_line
-    
-    return macd_line, signal_line, histogram
+def ema(closes: List[float], period: int) -> Optional[float]:
+    """Standard EMA (multiplier 2 / (period + 1)) over the whole series,
+    seeded with the SMA of the first ``period`` closes: the chart's formula
+    (trading_web_flutter lib/src/util/indicators.dart). None until
+    ``period`` closes.
+
+    It used to be a weighted mean of the last ``period`` closes only, close
+    to an SMA (EMA 200 was ~55 points off a real EMA 200 on Nifty-like
+    prices), and the last close on short series. The seed fades: after
+    ~5 x period closes the result no longer depends on where the series
+    starts (see analyzer.WARMUP_DAYS).
+    """
+    if period <= 0 or len(closes) < period:
+        return None
+    return _smoothed(np.asarray(closes, dtype=float), period, 2 / (period + 1))
+
+def macd(
+    closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Standard MACD (TradingView's ta.macd): line = EMA(fast) - EMA(slow),
+    signal = EMA(signal) of the line, histogram = line - signal. Every EMA
+    is ``ema()``'s (SMA seed, multiplier 2 / (n + 1)). (None, None, None)
+    until slow + signal - 1 closes, when the signal line has its seed.
+
+    It used to take the line from EMAs seeded at the first close and the
+    signal from a *different* MACD series (pandas' adjust=True weights),
+    so the histogram was the gap between two unrelated lines; and it gave
+    0.0 on short series.
+    """
+    if min(fast, slow, signal) <= 0 or len(closes) < slow + signal - 1:
+        return None, None, None
+    values = np.asarray(closes, dtype=float)
+    # Both EMAs aligned on the closes from index slow - 1 on.
+    ema_fast = _smoothed_series(values, fast, 2 / (fast + 1))[slow - fast:]
+    ema_slow = _smoothed_series(values, slow, 2 / (slow + 1))
+    line = ema_fast - ema_slow
+    signal_line = _smoothed(line, signal, 2 / (signal + 1))
+    return float(line[-1]), signal_line, float(line[-1]) - signal_line
 
 def atr(candles: List[Candle], period: int = 14) -> float:
     """Average True Range."""

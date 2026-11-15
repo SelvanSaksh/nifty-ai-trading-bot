@@ -409,7 +409,12 @@ class TestEngineSeriesAfterOutage:
         async def noop(*args, **kwargs):
             return None
 
+        async def range_stub(symbol, timeframe, start, end):
+            # 15m and 1h load their warm-up history by date range.
+            return await history_stub(symbol, timeframe, None)
+
         monkeypatch.setattr(engine.broker, "get_historical_candles", history_stub)
+        monkeypatch.setattr(engine.broker, "get_history_range", range_stub)
         monkeypatch.setattr(engine.broker, "reauthenticate", noop, raising=False)
         monkeypatch.setattr(engine.broker, "subscribe_ticks", noop)
 

@@ -24,6 +24,10 @@ OFFLINE_CONTEXT: Dict[str, Any] = {
 }
 
 
+#: Buffer cap of a replay: every weekday's bars of WARMUP_DAYS (25 15m bars a
+#: day), so EMA 200 settles as it does on the engine's warm-up history.
+MAX_BARS = 1600
+
 @dataclass(frozen=True)
 class Tick:
     time: datetime   # naive UTC
@@ -46,12 +50,13 @@ class Replay:
 class OfflineAnalyzer(Analyzer):
     """The live Analyzer with no network calls and bounded buffers.
 
-    A running engine holds the ~200 history bars it starts with plus what it
-    builds since; buffers are capped at ``max_bars`` so a year-long replay
-    stays fast and sees series of the same length the engine sees.
+    A running engine holds the WARMUP_DAYS of history it starts with (about
+    1,500 15m bars) plus what it builds since; buffers are capped at
+    ``max_bars`` so a year-long replay stays fast while the EMAs settle as
+    they do live.
     """
 
-    def __init__(self, max_bars: int = 400):
+    def __init__(self, max_bars: int = MAX_BARS):
         super().__init__()
         self.max_bars = max_bars
 
@@ -76,7 +81,7 @@ def minute_ticks(candle: Candle) -> List[Tick]:
     return [Tick(t + timedelta(seconds=15 * i), p) for i, p in enumerate(path)]
 
 
-async def replay(minutes: List[Candle], max_bars: int = 400) -> Replay:
+async def replay(minutes: List[Candle], max_bars: int = MAX_BARS) -> Replay:
     """Run 1m history through the Analyzer; collect ticks and 15m decisions."""
     analyzer = OfflineAnalyzer(max_bars)
     ticks: List[Tick] = []

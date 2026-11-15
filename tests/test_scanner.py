@@ -44,7 +44,7 @@ async def test_the_scanner_scores_a_symbol_as_the_live_engine_does():
                 "1h": [plain(c) for c in analyzer.candles_1h],
             }
 
-            async def fetch(_symbol, tf, _limit, history=history):
+            async def fetch(_symbol, tf, history=history):
                 return history[tf]
 
             scanner = Scanner(fetch, lambda: SYMBOLS[:1], engine, pace_seconds=0)
@@ -75,7 +75,7 @@ def bars(close: float, count: int = 230, step: float = 1.0, start=datetime(2026,
 
 
 def fake_history(by_symbol):
-    async def fetch(symbol, tf, _limit):
+    async def fetch(symbol, tf):
         value = by_symbol[symbol]
         if isinstance(value, Exception):
             raise value
@@ -150,7 +150,7 @@ def test_one_scan_per_closed_bar_during_the_session_and_one_per_day_outside():
 async def test_scan_if_due_skips_a_bar_already_scanned():
     calls = []
 
-    async def fetch(symbol, tf, _limit):
+    async def fetch(symbol, tf):
         calls.append((symbol, tf))
         return bars(1400) if tf == "15m" else []
 
@@ -166,7 +166,7 @@ async def test_scan_if_due_skips_a_bar_already_scanned():
 async def test_when_every_symbol_fails_it_retries_after_a_pause():
     failing = {"on": True}
 
-    async def fetch(_symbol, tf, _limit):
+    async def fetch(_symbol, tf):
         if failing["on"]:
             raise ConnectionError("token expired")
         return bars(1400) if tf == "15m" else []

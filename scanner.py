@@ -28,8 +28,6 @@ from utils.market_time import to_ist
 #: The decision timeframe, as the engine trades it.
 TIMEFRAME = "15m"
 TIMEFRAME_MINUTES = 15
-#: 200 closed candles (EMA 200 needs 200 closes) plus the one forming.
-HISTORY_BARS = 201
 #: Closed candles given their indicators, newest last. A running engine has
 #: them on every candle it sealed; the RSI divergence detector reads the RSI
 #: of the last 5 (every other detector reads prices only).
@@ -45,7 +43,9 @@ CHECK_SECONDS = 15.0
 #: this long rather than at once or only at the next bar.
 RETRY_AFTER = timedelta(minutes=2)
 
-FetchHistory = Callable[[str, str, int], Awaitable[List[Candle]]]
+#: (symbol, timeframe) -> the warm-up history the engine analyzes
+#: (analyzer.WARMUP_DAYS), oldest first.
+FetchHistory = Callable[[str, str], Awaitable[List[Candle]]]
 #: (symbol, name, instrument type) of every symbol to scan.
 SymbolList = Callable[[], List[Tuple[str, str, str]]]
 
@@ -100,12 +100,12 @@ class Scanner:
         base = {"symbol": symbol, "name": name, "instrument_type": kind}
         try:
             candles_15m = closed_candles(
-                await self._fetch(symbol, TIMEFRAME, HISTORY_BARS), TIMEFRAME_MINUTES, now
+                await self._fetch(symbol, TIMEFRAME), TIMEFRAME_MINUTES, now
             )
             await asyncio.sleep(self._pace)
             # The higher-timeframe filter reads the 1h series as the live
             # engine holds it (the forming bar included).
-            candles_1h = await self._fetch(symbol, "1h", HISTORY_BARS)
+            candles_1h = await self._fetch(symbol, "1h")
             await asyncio.sleep(self._pace)
             if not candles_15m:
                 return {**base, "error": "No closed 15m candles"}

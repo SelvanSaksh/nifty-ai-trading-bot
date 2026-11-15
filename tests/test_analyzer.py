@@ -64,10 +64,11 @@ def test_only_15m_close_is_returned_as_closed_candle():
         "a bare 5m rollover must not trigger the decision cycle"
     )
     assert len(analyzer.candles_5m) == 2  # 9:15 bar (sealed) + 9:20 bar (open)
-    # The first (now-sealed) 5m candle should have been finalized.
-    assert analyzer.candles_5m[0].rsi is not None
+    # The first (now-sealed) 5m candle should have been finalized. ATR is
+    # set on any sealed bar; RSI needs 15 closes (None before).
+    assert analyzer.candles_5m[0].atr is not None
     # The still-open second bar must not have indicators yet.
-    assert analyzer.candles_5m[1].rsi is None
+    assert analyzer.candles_5m[1].atr is None
 
 
 def test_indicators_computed_from_own_timeframe_series():
@@ -82,8 +83,9 @@ def test_indicators_computed_from_own_timeframe_series():
     prices = [100 + i * 0.5 for i in range(61)]
     _feed_ticks(analyzer, start, prices, minutes_per_tick=1)
 
-    sealed_5m = [c for c in analyzer.candles_5m if c.rsi is not None]
-    sealed_15m = [c for c in analyzer.candles_15m if c.rsi is not None]
+    # Finalized candles (ATR is set on any sealed bar).
+    sealed_5m = [c for c in analyzer.candles_5m if c.atr is not None]
+    sealed_15m = [c for c in analyzer.candles_15m if c.atr is not None]
     assert len(sealed_5m) >= 2
     assert len(sealed_15m) >= 2
     # 5m bars seal 3x more often than 15m bars over the same tick stream.
