@@ -120,6 +120,15 @@ class RiskManager:
             changed = True
         return changed
 
+    def daily_pnl_on(self, now: datetime) -> float:
+        """Closed-trade P&L of the IST day of ``now`` (IST wall-clock).
+
+        The counters roll over only when the gate runs (at a candle close or
+        a /api/risk/status read), so until then they may still hold an
+        earlier day's figure: that is not today's P&L, which is then 0.
+        """
+        return self.daily_pnl if self.day == now.date().isoformat() else 0.0
+
     # ── Limits ────────────────────────────────────────────────────
 
     @property

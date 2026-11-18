@@ -38,6 +38,7 @@ from features.watchlist import watchlist_manager
 from utils.engine_lock import EngineLockedError, SingletonFileLock
 from utils.market_structure import DEFAULT_STRENGTH, StructureTracker, closed_candles
 from utils.live_bars import LiveBarTracker, in_session
+from utils.market_time import ist_now
 from utils.market_status import is_live_session_tick, market_status
 from utils.helpers import (
     LIVE_TIMEFRAMES,
@@ -57,6 +58,19 @@ class SymbolValidationError(ValueError):
 
 class SymbolConflictError(Exception):
     """The active trading symbol cannot change right now (open trade)."""
+
+
+class TradeExitError(Exception):
+    """A requested exit of the open trade was refused or did not complete.
+
+    ``status`` is the HTTP status the API answers with: 409 when nothing was
+    sent (no open trade, wrong id, bot stopped, ...), 502 when the broker
+    did not close the whole position.
+    """
+
+    def __init__(self, message: str, status: int = 409):
+        super().__init__(message)
+        self.status = status
 
 
 class NiftyBot:
@@ -108,8 +122,10 @@ class NiftyBot:
         # until a restart reconciles it with the broker.
         self._trade_frozen = False
         self._exit_retry_at = 0.0  # time.monotonic()
-        # Last traded price of the active symbol.
+        # Last traded price of the active symbol, and when it arrived
+        # (naive UTC receive time).
         self._last_price: Optional[float] = None
+        self._last_price_time: Optional[datetime] = None
         # Receive time (naive UTC) of the last tick, of any symbol, printed
         # inside today's session: the market is live, not just scheduled.
         self._last_live_tick_at: Optional[datetime] = None
@@ -156,7 +172,7 @@ class NiftyBot:
     @property
     def today_pnl(self) -> float:
         """Realized P&L of the current IST trading day (closed trades)."""
-        return self.risk_manager.daily_pnl
+        return self.risk_manager.daily_pnl_on(ist_now())
 
     @property
     def uptime(self) -> str:
@@ -399,6 +415,10 @@ class NiftyBot:
             self.analyzer.candles_1h = history["1h"]
         self.analyzer_symbol = new_symbol
         self._history_cache.clear()
+        # The last price belonged to the old instrument (a switch never
+        # happens while a trade is open, so no trade is priced off it).
+        self._last_price = None
+        self._last_price_time = None
 
         if new_symbol not in self._all_symbols:
             self._all_symbols.append(new_symbol)
@@ -970,6 +990,7 @@ class NiftyBot:
         if not self.is_running or tick_symbol != self.symbol:
             return
         self._last_price = price
+        self._last_price_time = received_at
         
         # Build candles from the quantity traded since the previous tick.
         # Fyers keeps sending index ticks after the close; bars built from
@@ -994,6 +1015,10 @@ class NiftyBot:
         # If active trade, manage it every tick
         if self.active_trade:
             await self._manage_trade(price, timestamp)
+            # The day's P&L moves with every tick while a position is open
+            # (a close already sent its own update from _finish_trade).
+            if self.active_trade:
+                await self._broadcast_pnl()
         
         # If candle closed, run full analysis
         if closed_candle:
@@ -1611,6 +1636,7 @@ class NiftyBot:
 
         self.active_trade = None
         self._exit_retry_at = 0.0
+        await self._broadcast_pnl()
 
         # Apply a symbol switch that was deferred while this trade was open.
         if self._pending_symbol_state is not None:
@@ -1637,6 +1663,123 @@ class NiftyBot:
                     f"🚨 {trade.id} is STILL OPEN after '{reason}' — "
                     "check the Fyers account (the broker stop-loss stays in place)"
                 )
+
+    async def exit_trade_now(self, trade_id: Optional[str] = None) -> Dict[str, Any]:
+        """Close the whole open trade at market now, at the user's request
+        (POST /api/trades/exit). Booked like any other exit, with the reason
+        ``MANUAL_EXIT``; it counts toward the day's trades and P&L.
+
+        A paper trade is booked at the last traded price. A live trade goes
+        to the broker (its stop is cancelled first) and is booked at the
+        fill. Raises TradeExitError when nothing could be sent, or when the
+        broker did not close all of it (the rest stays open, still managed
+        by the bot and protected by its broker stop).
+        """
+        async with self._trade_lock:
+            trade = self.active_trade
+            if trade is None:
+                raise TradeExitError("No trade is open")
+            if trade_id and trade_id != trade.id:
+                raise TradeExitError(
+                    f"Trade {trade_id} is not the open trade (that is {trade.id}); refresh and try again"
+                )
+            if not self.is_running:
+                raise TradeExitError(
+                    f"The bot is stopped, so it cannot send the exit of {trade.id}. "
+                    "Start it again, or close the position in the Fyers account."
+                )
+            if self._trade_frozen:
+                raise TradeExitError(
+                    f"The broker state of {trade.id} is unknown, so the bot does not touch it. "
+                    "Check the Fyers account, then restart the bot."
+                )
+            price = self._last_price
+            if price is None:
+                if trade.paper_trade:
+                    raise TradeExitError(
+                        f"No price for {trade.symbol} has arrived since the bot started; "
+                        "a paper exit is booked at the last traded price. Try again once ticks flow."
+                    )
+                # Only a fallback: a live exit is booked at the broker's fill.
+                price = trade.entry_price
+
+            await self._exit_trade(price, datetime.utcnow(), "MANUAL_EXIT")
+
+            if self.active_trade is not None:
+                raise TradeExitError(
+                    f"The exit of {trade.id} did not complete: {trade.remaining_qty} "
+                    f"{trade.symbol} still open. The bot keeps managing it and its broker "
+                    "stop stays in place; see the alerts, or check the Fyers account.",
+                    status=502,
+                )
+
+        reason = trade.exit_reason or "MANUAL_EXIT"
+        how = "closed" if reason == "MANUAL_EXIT" else f"closed by {reason}"
+        return {
+            "message": (
+                f"Trade {trade.id} {how} at {trade.exit_price}: "
+                f"P&L {trade.realized_pnl:+,.2f}"
+            ),
+            "trade": trade.model_dump(),
+            "day_pnl": self.day_pnl(),
+        }
+
+    # ── Day P&L (live) ────────────────────────────────────────────
+
+    def open_position_pnl(self) -> Optional[Dict[str, Any]]:
+        """The open trade marked to the last traded price, or None when flat.
+
+        ``unrealized_pnl`` is null while no price of the trade's symbol has
+        arrived since the bot started (it is never guessed).
+        """
+        trade = self.active_trade
+        if trade is None:
+            return None
+        price = self._last_price if trade.symbol == self.symbol else None
+        unrealized = (
+            self._calculate_pnl(trade, price, trade.remaining_qty)
+            if price is not None
+            else None
+        )
+        price_time = self._last_price_time if price is not None else None
+        return {
+            "trade_id": trade.id,
+            "symbol": trade.symbol,
+            "direction": trade.direction.value,
+            "entry_price": trade.entry_price,
+            "remaining_qty": trade.remaining_qty,
+            "price": price,
+            "price_time": price_time.isoformat() if price_time else None,
+            # Booked by T1/T2 partial exits; it joins the day's closed P&L
+            # when the trade closes.
+            "realized_pnl": round(trade.realized_pnl, 2),
+            "unrealized_pnl": round(unrealized, 2) if unrealized is not None else None,
+        }
+
+    def day_pnl(self) -> Dict[str, Any]:
+        """Today's (IST) P&L, live: closed trades plus the open position.
+
+        ``closed`` is what the risk gate checks (``today_pnl``). ``total``
+        adds the open trade's partial exits and its mark at the last price;
+        ``marked`` is false when the open trade has no price yet, so
+        ``total`` leaves its unrealized part out.
+        """
+        closed = self.today_pnl
+        position = self.open_position_pnl()
+        open_realized = position["realized_pnl"] if position else 0.0
+        unrealized = position["unrealized_pnl"] if position else None
+        total = closed + open_realized + (unrealized or 0.0)
+        return {
+            "closed": round(closed, 2),
+            "open_realized": round(open_realized, 2),
+            "unrealized": unrealized,
+            "total": round(total, 2),
+            "marked": position is None or unrealized is not None,
+            "position": position,
+        }
+
+    async def _broadcast_pnl(self):
+        await self._broadcast({"type": "pnl", **self.day_pnl()})
 
     # ── Restart recovery ──────────────────────────────────────────
 

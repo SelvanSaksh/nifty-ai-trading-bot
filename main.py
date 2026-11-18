@@ -22,7 +22,7 @@ from typing import Optional
 from urllib.parse import unquote
 from pydantic import BaseModel, Field
 
-from bot import NiftyBot, SymbolConflictError, SymbolValidationError
+from bot import NiftyBot, SymbolConflictError, SymbolValidationError, TradeExitError
 from database import (
     init_db,
     get_active_symbol_state,
@@ -287,6 +287,9 @@ async def get_status():
         "active_trade": bot.active_trade.model_dump() if bot.active_trade else None,
         "paper_mode": settings.PAPER_TRADING,
         "today_pnl": round(bot.today_pnl, 2),
+        # Today's P&L live: closed trades + the open trade's partial exits
+        # and its mark at the last price (also pushed as `pnl` on /ws/live).
+        "day_pnl": bot.day_pnl(),
         # Why new trades are blocked (broker position mismatch, ...), or null.
         "trading_halted": bot.trading_halted,
         "symbol": active["symbol"],
@@ -352,6 +355,25 @@ async def get_trade(trade_id: str):
         if trade.id == trade_id:
             return trade.model_dump()
     return {"error": "Trade not found"}
+
+
+class ExitTradeRequest(BaseModel):
+    # The trade the client means to close; refused if another one is open.
+    trade_id: Optional[str] = Field(default=None, max_length=64)
+
+
+@app.post("/api/trades/exit", dependencies=[Depends(require_admin)])
+async def exit_open_trade(request: ExitTradeRequest):
+    """Close the whole open trade at market now (reason ``MANUAL_EXIT``).
+
+    409: nothing was sent (no open trade, another trade id, bot stopped,
+    broker state unknown, no price yet for a paper exit). 502: the broker
+    did not close all of it; the rest stays open and managed.
+    """
+    try:
+        return await app.state.bot.exit_trade_now(request.trade_id)
+    except TradeExitError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
 
 
 # ── Signals ─────────────────────────────────────────────────────
