@@ -427,13 +427,33 @@ async def get_open_trade() -> Optional[Trade]:
     return _row_to_trade(row) if row is not None else None
 
 
-async def get_recent_trades(limit: int = 20) -> List[Trade]:
+async def get_recent_trades(limit: int = 20, offset: int = 0) -> List[Trade]:
+    """Newest first; ``offset`` skips that many (paging)."""
     async with _db() as db:
         cursor = await db.execute(
-            "SELECT * FROM trades ORDER BY entry_time DESC LIMIT ?", (limit,)
+            "SELECT * FROM trades ORDER BY entry_time DESC, id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         )
         rows = await cursor.fetchall()
         return [_row_to_trade(row) for row in rows]
+
+
+async def get_trade(trade_id: str) -> Optional[Trade]:
+    async with _db() as db:
+        cursor = await db.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
+        row = await cursor.fetchone()
+    return _row_to_trade(row) if row is not None else None
+
+
+async def get_closed_trades() -> List[Trade]:
+    """Every closed trade, oldest close first."""
+    async with _db() as db:
+        cursor = await db.execute(
+            "SELECT * FROM trades WHERE status = 'CLOSED' "
+            "ORDER BY COALESCE(exit_time, entry_time), id"
+        )
+        rows = await cursor.fetchall()
+    return [_row_to_trade(row) for row in rows]
 
 
 async def get_recent_signals(limit: int = 20, include_wait: bool = True) -> List[Signal]:

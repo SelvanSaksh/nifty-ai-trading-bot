@@ -56,3 +56,17 @@ async def test_gate_blocks_exactly_at_the_reported_limits(monkeypatch):
 
 async def _noop(*_args, **_kwargs):
     return None
+
+
+def test_cooldown_is_served_as_utc(client):
+    """The risk manager keeps IST wall-clock time; the API serves naive UTC
+    (the dashboard adds +05:30 itself), so 11:30 IST goes out as 06:00."""
+    import main
+
+    rm = main.app.state.bot.risk_manager
+    rm.cooldown_until = datetime(2026, 10, 21, 11, 30)  # IST
+    try:
+        body = client.get("/api/risk/status").json()
+    finally:
+        rm.cooldown_until = None
+    assert body["cooldown_until"] == "2026-10-21T06:00:00"

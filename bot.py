@@ -1930,8 +1930,8 @@ class NiftyBot:
             "losses": total - wins
         }
     
-    async def get_recent_trades(self, limit: int = 20):
-        return await get_recent_trades(limit)
+    async def get_recent_trades(self, limit: int = 20, offset: int = 0):
+        return await get_recent_trades(limit, offset)
     
     async def get_recent_signals(self, limit: int = 20, include_wait: bool = True):
         return await get_recent_signals(limit, include_wait)

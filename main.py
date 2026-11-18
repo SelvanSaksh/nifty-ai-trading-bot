@@ -26,10 +26,13 @@ from bot import NiftyBot, SymbolConflictError, SymbolValidationError, TradeExitE
 from database import (
     init_db,
     get_active_symbol_state,
+    get_closed_trades,
     get_decision_summary,
     get_recent_decisions,
     get_symbol_change_history,
+    get_trade as get_trade_by_id,
 )
+from utils.pnl_history import daily_pnl
 from trading_mcp.server import mcp_app, set_bot_instance
 from config import settings, ensure_data_dir, public_config
 from fyers_auth import (
@@ -344,17 +347,28 @@ async def get_stats():
 # ── Trades ──────────────────────────────────────────────────────
 
 @app.get("/api/trades")
-async def get_recent_trades(limit: int = 20):
-    return await app.state.bot.get_recent_trades(limit)
+async def get_recent_trades(limit: int = 20, offset: int = 0):
+    """Newest first. Page with ``offset``; a page shorter than ``limit`` is
+    the last one."""
+    limit = max(1, min(limit, 200))
+    return await app.state.bot.get_recent_trades(limit, max(0, offset))
 
 
 @app.get("/api/trades/{trade_id}")
 async def get_trade(trade_id: str):
-    trades = await app.state.bot.get_recent_trades(1000)
-    for trade in trades:
-        if trade.id == trade_id:
-            return trade.model_dump()
-    return {"error": "Trade not found"}
+    trade = await get_trade_by_id(trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail=f"Trade {trade_id} not found")
+    return trade.model_dump()
+
+
+@app.get("/api/pnl/daily")
+async def get_daily_pnl(days: int = 30):
+    """Closed-trade P&L per IST day (the day each trade closed), oldest
+    first, with the running total (equity curve) and max drawdown over all
+    closed trades. Only days with a close are listed."""
+    days = max(1, min(days, 366))
+    return daily_pnl(await get_closed_trades(), days)
 
 
 class ExitTradeRequest(BaseModel):
@@ -633,7 +647,13 @@ async def get_risk_status():
         "weekly_pnl": round(rm.weekly_pnl, 2),
         "trades_today": rm.trades_today,
         "consecutive_losses": rm.consecutive_losses,
-        "cooldown_until": rm.cooldown_until.isoformat() if rm.cooldown_until else None,
+        # Naive UTC like every other time the API serves (the risk manager
+        # keeps IST wall-clock time internally).
+        "cooldown_until": (
+            (rm.cooldown_until - IST.utcoffset(None)).isoformat()
+            if rm.cooldown_until
+            else None
+        ),
         # The limits the gate checks the values above against.
         "daily_loss_limit": round(rm.daily_loss_limit, 2),
         "weekly_loss_limit": round(rm.weekly_loss_limit, 2),
