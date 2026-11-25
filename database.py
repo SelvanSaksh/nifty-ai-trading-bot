@@ -192,6 +192,12 @@ async def init_db():
             "exit_reason": "TEXT",
             "entry_order_id": "TEXT",
             "sl_order_id": "TEXT",
+            "option_symbol": "TEXT",
+            "option_type": "TEXT",
+            "option_strike": "REAL",
+            "option_expiry": "TEXT",
+            "lot_size": "INTEGER",
+            "underlying_entry_price": "REAL",
         })
 
 
@@ -374,8 +380,13 @@ _TRADE_COLUMNS = (
     "symbol", "symbol_name",
     "exit_price", "exit_time", "exit_reason",
     "entry_order_id", "sl_order_id",
+    "option_symbol", "option_type", "option_strike", "option_expiry",
+    "lot_size", "underlying_entry_price",
 )
-_TRADE_TIMES = {"entry_time", "exit_t1_time", "exit_t2_time", "exit_t3_time", "exit_sl_time", "exit_time"}
+_TRADE_TIMES = {
+    "entry_time", "exit_t1_time", "exit_t2_time", "exit_t3_time", "exit_sl_time",
+    "exit_time", "option_expiry",
+}
 
 
 def _trade_value(trade: Trade, column: str):

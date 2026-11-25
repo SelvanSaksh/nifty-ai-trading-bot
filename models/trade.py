@@ -46,6 +46,19 @@ class Trade(BaseModel):
     entry_order_id: Optional[str] = None
     sl_order_id: Optional[str] = None
 
+    # Index option trades (Bank Nifty): ``symbol`` is the index whose chart
+    # gave the signal, and stop_loss / target_1..3 are INDEX levels, checked
+    # against the index price. What is bought is ``option_symbol``: every
+    # entry/exit price and the P&L are its premium. ``underlying_entry_price``
+    # is the index close the levels were measured from (the breakeven stop
+    # after T1 moves to it). All None for equity and index-futures trades.
+    option_symbol: Optional[str] = None
+    option_type: Optional[str] = None
+    option_strike: Optional[float] = None
+    option_expiry: Optional[datetime] = None
+    lot_size: Optional[int] = None
+    underlying_entry_price: Optional[float] = None
+
     # P&L
     realized_pnl: float = 0.0
     result: Optional[SignalResult] = None

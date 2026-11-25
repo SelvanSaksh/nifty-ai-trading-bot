@@ -80,7 +80,7 @@ class FyersBroker(BaseBroker):
         # Initialize per-symbol starting prices with realistic values
         for sym in symbols:
             if sym not in self._symbol_prices:
-                self._symbol_prices[sym] = self._DEFAULT_PRICES.get(sym, 24500.0)
+                self._symbol_prices[sym] = self._start_price(sym)
         self._session = asyncio.create_task(self._generate_mock_ticks())
         print(f"[MOCK] Subscribed to: {symbols}")
     
@@ -106,6 +106,22 @@ class FyersBroker(BaseBroker):
             
             await asyncio.sleep(1)
     
+    #: Simulated premium an option contract starts at (mock data only).
+    MOCK_OPTION_PREMIUM = 300.0
+
+    def _start_price(self, symbol: str) -> float:
+        if symbol.endswith(("CE", "PE")) and not symbol.endswith("-EQ"):
+            return self.MOCK_OPTION_PREMIUM
+        return self._DEFAULT_PRICES.get(symbol, 24500.0)
+
+    async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Simulated quote: the last simulated price, half a rupee either side."""
+        price = self._symbol_prices.get(symbol)
+        if price is None:
+            price = self._start_price(symbol)
+            self._symbol_prices[symbol] = price
+        return {"ltp": price, "bid": round(price - 0.5, 2), "ask": round(price + 0.5, 2)}
+
     async def get_history_range(
         self, symbol: str, timeframe: str, start: datetime, end: datetime
     ) -> list[Candle]:

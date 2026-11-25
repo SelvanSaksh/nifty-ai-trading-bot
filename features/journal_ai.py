@@ -255,7 +255,9 @@ class TradeJournalAI:
                 suggestions.append("Look for setups with better risk-reward ratio (min 1.5:1)")
             
             # Check if stop was too tight
-            risk = abs(trade.entry_price - trade.stop_loss)
+            # Index option trades: the stop is an index level, the entry a premium.
+            level = trade.underlying_entry_price if trade.underlying_entry_price is not None else trade.entry_price
+            risk = abs(level - trade.stop_loss)
             if risk < 30:  # Very tight stop for Nifty
                 suggestions.append("Stop loss may have been too tight — consider wider stops in volatile conditions")
         

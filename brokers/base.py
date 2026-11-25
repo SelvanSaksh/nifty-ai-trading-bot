@@ -59,6 +59,11 @@ class BaseBroker(ABC):
         """
         pass
 
+    async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """``{"ltp", "bid", "ask"}`` of ``symbol`` now (a value is None when
+        the broker gave none or a non-positive one), or None if unavailable."""
+        return None
+
     @abstractmethod
     async def place_stop_order(self, symbol: str, side: int, qty: int, stop_price: float) -> Dict[str, Any]:
         """Intraday stop-loss market order (SL-M) triggered at ``stop_price``."""

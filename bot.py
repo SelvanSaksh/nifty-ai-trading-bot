@@ -35,6 +35,13 @@ from models.trade import Trade
 from models.enums import Direction, TradeStatus, SignalResult
 from config import settings
 from features.watchlist import watchlist_manager
+from features.option_contracts import (
+    OPTION_UNDERLYINGS,
+    OptionContractError,
+    describe as describe_contract,
+    option_book,
+    trades_options,
+)
 from utils.engine_lock import EngineLockedError, SingletonFileLock
 from utils.market_structure import DEFAULT_STRENGTH, StructureTracker, closed_candles
 from utils.live_bars import LiveBarTracker, in_session
@@ -94,6 +101,9 @@ class NiftyBot:
     ORDER_FILL_POLL_SECONDS = 0.5
     # Pause before an exit that did not go through is tried again.
     EXIT_RETRY_SECONDS = 10.0
+    # A paper option exit falls back to the contract's last tick only when
+    # the quote has no price and that tick is at most this old.
+    OPTION_MARK_MAX_AGE = timedelta(seconds=120)
 
     def __init__(self):
         mode = settings.BROKER_MODE.strip().lower()
@@ -169,6 +179,14 @@ class NiftyBot:
         self.watchlist_quotes: Dict[str, Dict[str, Any]] = {}
         self._all_symbols: List[str] = []
 
+        # Index option trades (Bank Nifty calls): the day's contracts, and the
+        # last tick of every option contract subscribed for a trade:
+        # {symbol: (price, received at, naive UTC)}.
+        self.option_book = option_book
+        self._option_symbols: set = set()
+        self._option_marks: Dict[str, Tuple[float, datetime]] = {}
+        self._options_task: Optional[asyncio.Task] = None
+
     @property
     def today_pnl(self) -> float:
         """Realized P&L of the current IST trading day (closed trades)."""
@@ -221,6 +239,12 @@ class NiftyBot:
             self._all_symbols = [item.symbol for item in default_wl.items]
             if self.symbol not in self._all_symbols:
                 self._all_symbols.append(self.symbol)
+            # A restored option trade keeps getting its contract's ticks.
+            restored = self.active_trade.option_symbol if self.active_trade else None
+            if restored:
+                self._option_symbols.add(restored)
+                if restored not in self._all_symbols:
+                    self._all_symbols.append(restored)
             await self.broker.subscribe_ticks(self._all_symbols)
             print(f"[BOT] Subscribed to {len(self._all_symbols)} symbols for watchlist")
 
@@ -228,6 +252,9 @@ class NiftyBot:
             self.start_time = datetime.utcnow()
             self._reconcile_task = asyncio.create_task(self._reconcile_loop())
             self._scan_task = asyncio.create_task(self.scanner.run())
+            if trades_options(self.symbol):
+                # Load the day's contracts now, not at the first signal.
+                self._options_task = asyncio.create_task(self._preload_options())
         except BaseException:
             self.engine_leader = False
             self._engine_lock.release()
@@ -237,6 +264,18 @@ class NiftyBot:
             f"🚀 {self.symbol_name} AI Bot started for {self.symbol} "
             f"(Paper: {settings.PAPER_TRADING}, symbol v{self.symbol_version})"
         )
+
+    async def _preload_options(self):
+        """Loads the active index's call contracts (failure only logged: the
+        first signal tries again, and says why if it still fails)."""
+        underlying = OPTION_UNDERLYINGS.get(self.symbol)
+        if underlying is None:
+            return
+        try:
+            contracts = await self.option_book.contracts(underlying)
+            print(f"[OPTIONS] {len(contracts)} {underlying} calls loaded from the symbol master")
+        except Exception as exc:
+            print(f"[OPTIONS] Symbol master not loaded yet: {exc}")
 
     async def stop(self):
         """Stop the bot engine."""
@@ -963,6 +1002,16 @@ class NiftyBot:
         if is_live_session_tick(timestamp, received_at):
             self._last_live_tick_at = received_at
 
+        if tick_symbol in self._option_symbols:
+            # An option contract bought for a trade: only its price matters
+            # (marking the open trade); it is not a watchlist or chart symbol.
+            if price and price > 0:
+                self._option_marks[tick_symbol] = (float(price), received_at)
+                trade = self.active_trade
+                if self.is_running and trade is not None and trade.option_symbol == tick_symbol:
+                    await self._broadcast_pnl()
+            return
+
         # ``v`` is the day's cumulative traded volume, not this tick's.
         traded = self._traded_since_last_tick(tick_symbol, volume, received_at)
 
@@ -1235,16 +1284,41 @@ class NiftyBot:
             if self.trading_halted:
                 return f"New trades blocked: {self.trading_halted}"
             paper = settings.PAPER_TRADING
-            if not paper and not self.symbol.endswith("-EQ"):
+            contract = None
+            option_fields: Dict[str, Any] = {}
+            if trades_options(self.symbol):
+                # The index is not bought: its at-the-money call is, while
+                # the stop and targets stay index levels (see models/trade.py).
+                planned = await self._plan_option_entry(signal, entry_price, paper)
+                if isinstance(planned, str):
+                    return planned
+                contract, premium, sized = planned
+                if sized.qty <= 0:
+                    return (
+                        f"{describe_contract(contract)} at ₹{premium:,.2f}: {sized.why_zero()} "
+                        f"(worst case per unit: the smaller of the premium and the "
+                        f"{abs(entry_price - signal.stop_loss):,.2f}-point index stop)"
+                    )
+                option_fields = {
+                    "option_symbol": contract.symbol,
+                    "option_type": contract.option_type,
+                    "option_strike": contract.strike,
+                    "option_expiry": contract.expiry,
+                    "lot_size": contract.lot_size,
+                    "underlying_entry_price": entry_price,
+                }
+                fill_price = premium
+            elif not paper and not self.symbol.endswith("-EQ"):
                 return (
                     f"{self.symbol} cannot be traded live: only NSE equities (-EQ) "
                     "are supported; an index has no orders"
                 )
-
-            lot = self.risk_manager.lot_size_for(self.symbol)
-            sized = self.risk_manager.size_position(
-                signal, entry_price, lot, self.risk_manager.max_position_value(self.symbol)
-            )
+            else:
+                lot = self.risk_manager.lot_size_for(self.symbol)
+                sized = self.risk_manager.size_position(
+                    signal, entry_price, lot, self.risk_manager.max_position_value(self.symbol)
+                )
+                fill_price = entry_price
             qty = sized.qty
             if qty <= 0:
                 return sized.why_zero()
@@ -1253,7 +1327,7 @@ class NiftyBot:
                 # Naive UTC, like every time the API serves.
                 entry_time=datetime.utcnow(),
                 direction=signal.direction,
-                entry_price=entry_price,
+                entry_price=fill_price,
                 quantity=qty,
                 initial_qty=qty,
                 remaining_qty=qty,
@@ -1267,7 +1341,8 @@ class NiftyBot:
                 symbol_name=self.symbol_name,
                 signal_score=signal.score,
                 confidence=signal.confidence,
-                paper_trade=paper
+                paper_trade=paper,
+                **option_fields,
             )
 
             if not paper and not await self._open_live_position(trade):
@@ -1275,8 +1350,10 @@ class NiftyBot:
 
             self.active_trade = trade
             await save_trade(trade)
+            if contract is not None:
+                await self._watch_option(contract.symbol)
 
-            msg = (
+            msg = self._entry_message(trade, contract) if contract is not None else (
                 f"📊 {'PAPER' if paper else 'LIVE'} TRADE ENTERED\n"
                 f"Symbol: {trade.symbol_name} ({trade.symbol})\n"
                 f"Direction: {trade.direction.value}\n"
@@ -1296,6 +1373,78 @@ class NiftyBot:
                 )
                 await self._exit_trade(trade.entry_price, datetime.utcnow(), "STOP_ORDER_FAILED")
             return None
+
+    @staticmethod
+    def _entry_message(trade: Trade, contract) -> str:
+        return (
+            "📊 PAPER OPTION TRADE ENTERED\n"
+            f"Bought: {describe_contract(contract)} = {contract.symbol}\n"
+            f"Premium: {trade.entry_price} x {trade.quantity} "
+            f"({trade.quantity // contract.lot_size} lot)\n"
+            f"{trade.symbol_name} at {trade.underlying_entry_price}: SL {trade.stop_loss} | "
+            f"T1 {trade.target_1} | T2 {trade.target_2} | T3 {trade.target_3} (index levels)\n"
+            f"Score: {trade.signal_score}/100 | Confidence: {trade.confidence:.0%}"
+        )
+
+    async def _plan_option_entry(self, signal: Signal, index_price: float, paper: bool):
+        """(contract, premium, size) of the call bought for ``signal``, or why
+        none is bought."""
+        if signal.direction != Direction.LONG:
+            return (
+                f"{self.symbol_name} is traded with call options only: "
+                f"{signal.direction.value} signals are not traded"
+            )
+        if not paper:
+            return (
+                f"{self.symbol_name} options are paper-traded only: live option orders "
+                "are not implemented (options allow no SL-M stop orders)"
+            )
+        try:
+            contract = await self.option_book.atm_call(
+                self.symbol, index_price, datetime.utcnow()
+            )
+        except OptionContractError as exc:
+            return f"No call option chosen: {exc}"
+        premium = await self._option_price(contract.symbol, buying=True, allow_mark=False)
+        if premium is None:
+            return f"No price for {contract.symbol} ({describe_contract(contract)}): not entered"
+        sized = self.risk_manager.size_option_position(
+            signal, premium, index_price, contract.lot_size,
+            settings.CAPITAL * settings.MAX_POSITION_LEVERAGE,
+        )
+        return contract, premium, sized
+
+    async def _option_price(
+        self, symbol: str, buying: bool, allow_mark: bool = True
+    ) -> Optional[float]:
+        """The price a paper order of option ``symbol`` fills at now: the ask
+        to buy, the bid to sell, else the last traded price; then (exits only)
+        its last tick if recent. None when there is no positive price."""
+        quote = None
+        try:
+            quote = await self.broker.get_quote(symbol)
+        except Exception as exc:
+            print(f"[OPTIONS] Quote of {symbol} failed: {exc}")
+        if quote:
+            for value in (quote.get("ask" if buying else "bid"), quote.get("ltp")):
+                if value is not None and value > 0:
+                    return float(value)
+        if allow_mark:
+            mark = self._option_marks.get(symbol)
+            if mark is not None and datetime.utcnow() - mark[1] <= self.OPTION_MARK_MAX_AGE:
+                return mark[0]
+        return None
+
+    async def _watch_option(self, symbol: str):
+        """Subscribe ``symbol``'s ticks (they mark the open trade)."""
+        self._option_symbols.add(symbol)
+        if symbol not in self._all_symbols:
+            self._all_symbols.append(symbol)
+        try:
+            # The whole list: the mock broker replaces its subscriptions.
+            await self.broker.subscribe_ticks(self._all_symbols)
+        except Exception as exc:
+            print(f"[OPTIONS] Ticks of {symbol} not subscribed: {exc}")
 
     async def _open_live_position(self, trade: Trade) -> bool:
         """Send the entry and its broker stop. False if no position opened."""
@@ -1401,6 +1550,17 @@ class NiftyBot:
         None when nothing was closed (the position is unchanged; retry later).
         """
         if trade.paper_trade:
+            if trade.option_symbol:
+                # ``price`` is the index level that triggered the exit; the
+                # call is sold at its own price.
+                fill = await self._option_price(trade.option_symbol, buying=False)
+                if fill is None:
+                    await self.notifier.send(
+                        f"⚠️ No price for {trade.option_symbol}: exit of {trade.id} "
+                        f"postponed, retrying in {self.EXIT_RETRY_SECONDS:.0f}s"
+                    )
+                    return None
+                return qty, fill, False
             return qty, price, False
 
         stop_fill = await self._broker_stop_fill(trade)
@@ -1468,8 +1628,12 @@ class NiftyBot:
                 return
             now = datetime.utcnow()
             if trade_rules.square_off_due(trade, now):
-                # A paper trade needs a real price; a live one is filled by the broker.
-                price = self._last_price or (None if trade.paper_trade else trade.entry_price)
+                # A paper trade needs a real price; a live one is filled by the
+                # broker; an option trade is priced from its own quote.
+                if trade.option_symbol:
+                    price = self._last_price or trade_rules.level_entry(trade)
+                else:
+                    price = self._last_price or (None if trade.paper_trade else trade.entry_price)
                 if price is not None:
                     await self._exit_trade(price, now, "EOD_SQUARE_OFF")
                 return
@@ -1508,9 +1672,7 @@ class NiftyBot:
         if the exit rules say so (breakeven after T1)."""
         trade = self.active_trade
         label = "T1" if new_status == TradeStatus.PARTIAL_1 else "T2"
-        exit_qty = trade_rules.partial_qty(
-            trade, fraction, self.risk_manager.lot_size_for(trade.symbol)
-        )
+        exit_qty = trade_rules.partial_qty(trade, fraction, self._lot_of(trade))
 
         if exit_qty <= 0:
             # Too small to split: the whole position rides to the next target.
@@ -1644,6 +1806,10 @@ class NiftyBot:
             self._pending_symbol_state = None
             asyncio.ensure_future(self._apply_pending_symbol(pending))
 
+    def _lot_of(self, trade: Trade) -> int:
+        """The traded instrument's lot (an option's own, from the master)."""
+        return trade.lot_size or self.risk_manager.lot_size_for(trade.symbol)
+
     def _calculate_pnl(self, trade: Trade, exit_price: float, qty: int) -> float:
         if trade.direction == Direction.LONG:
             return (exit_price - trade.entry_price) * qty
@@ -1694,6 +1860,9 @@ class NiftyBot:
                     "Check the Fyers account, then restart the bot."
                 )
             price = self._last_price
+            if price is None and trade.option_symbol:
+                # The call is sold at its own quote; the index price is unused.
+                price = trade_rules.level_entry(trade)
             if price is None:
                 if trade.paper_trade:
                     raise TradeExitError(
@@ -1735,16 +1904,23 @@ class NiftyBot:
         trade = self.active_trade
         if trade is None:
             return None
-        price = self._last_price if trade.symbol == self.symbol else None
+        if trade.option_symbol:
+            # Marked at the call's own last tick, never at the index price.
+            mark = self._option_marks.get(trade.option_symbol)
+            price, price_time = mark if mark is not None else (None, None)
+        else:
+            price = self._last_price if trade.symbol == self.symbol else None
+            price_time = self._last_price_time if price is not None else None
         unrealized = (
             self._calculate_pnl(trade, price, trade.remaining_qty)
             if price is not None
             else None
         )
-        price_time = self._last_price_time if price is not None else None
         return {
             "trade_id": trade.id,
             "symbol": trade.symbol,
+            # The contract bought (index option trades), else null.
+            "option_symbol": trade.option_symbol,
             "direction": trade.direction.value,
             "entry_price": trade.entry_price,
             "remaining_qty": trade.remaining_qty,

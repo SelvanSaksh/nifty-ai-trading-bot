@@ -38,10 +38,19 @@ def square_off_due(trade: Trade, now_utc: datetime) -> bool:
     )
 
 
+def level_entry(trade: Trade) -> float:
+    """The price the stop and targets are measured from: the index close for
+    an index option trade (its entry_price is the option premium), else the
+    entry price."""
+    if trade.underlying_entry_price is not None:
+        return trade.underlying_entry_price
+    return trade.entry_price
+
+
 def breakeven_stop(trade: Trade) -> Optional[float]:
-    """The entry price (on the price step) as the stop after T1, or None when
+    """The entry level (on the price step) as the stop after T1, or None when
     the current stop already protects at least that much."""
-    stop = round_to_tick(trade.entry_price)
+    stop = round_to_tick(level_entry(trade))
     if trade.direction == Direction.LONG:
         return stop if stop > trade.stop_loss else None
     return stop if stop < trade.stop_loss else None

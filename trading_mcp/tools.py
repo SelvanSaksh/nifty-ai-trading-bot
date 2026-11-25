@@ -261,6 +261,10 @@ class MCPTools:
             "id": trade.id,
             "direction": trade.direction.value if hasattr(trade.direction, 'value') else str(trade.direction),
             "entry_price": trade.entry_price,
+            # Index option trades: entry_price is the premium of option_symbol;
+            # stop/targets are index levels measured from underlying_entry_price.
+            "option_symbol": trade.option_symbol,
+            "underlying_entry_price": trade.underlying_entry_price,
             "entry_time": trade.entry_time.isoformat() if trade.entry_time else None,
             "quantity": trade.quantity,
             "remaining_qty": trade.remaining_qty,

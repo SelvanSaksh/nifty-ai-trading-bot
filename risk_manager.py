@@ -294,6 +294,43 @@ class RiskManager:
 
         return size(lots * lot_size)
 
+    def size_option_position(
+        self,
+        signal: Signal,
+        premium: float,
+        index_price: float,
+        lot_size: int,
+        max_value: Optional[float] = None,
+    ) -> PositionSize:
+        """Lots of a bought index option, sized on the worst case at the
+        index stop.
+
+        A bought option cannot lose more than its premium, nor more than the
+        index move (its delta is at most 1), so one unit risks
+        ``min(premium, |index price - index stop|)`` if the index reaches the
+        stop. Time decay and volatility changes are not in that figure.
+        The allowed risk is the same as ``size_position``'s (RISK_PER_TRADE,
+        scaled 50-100% by confidence); ``max_value`` caps premium x quantity
+        (the premium is paid in full). Whole lots only: 0 when one lot is
+        over either limit.
+        """
+        risk_amount = settings.CAPITAL * settings.RISK_PER_TRADE
+        confidence = min(1.0, max(0.0, signal.confidence))
+        adjusted_risk = risk_amount * (0.5 + 0.5 * confidence)
+        lot_size = max(1, int(lot_size))
+        stop_distance = abs(index_price - signal.stop_loss)
+        risk_per_unit = min(premium, stop_distance) if premium > 0 else 0.0
+
+        def size(qty: int) -> PositionSize:
+            return PositionSize(qty, lot_size, premium, adjusted_risk, risk_per_unit, max_value)
+
+        if risk_per_unit <= 0:
+            return size(0)
+        raw_qty = int(adjusted_risk / risk_per_unit)
+        if max_value is not None:
+            raw_qty = min(raw_qty, int(max_value / premium))
+        return size(raw_qty // lot_size * lot_size)
+
     def update_after_trade(self, trade: Trade, now: datetime = None):
         """Update risk counters after trade close (the caller saves).
 

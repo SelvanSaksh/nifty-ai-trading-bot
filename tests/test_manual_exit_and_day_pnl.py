@@ -199,7 +199,8 @@ async def test_day_pnl_marks_the_open_trade_to_the_last_price(paper_bot):
     assert pnl["unrealized"] == 700.0  # 100 x 7
     assert pnl["total"] == 1700.0 and pnl["marked"] is True
     assert pnl["position"] == {
-        "trade_id": trade.id, "symbol": "NSE:NIFTY50-INDEX", "direction": "LONG",
+        "trade_id": trade.id, "symbol": "NSE:NIFTY50-INDEX", "option_symbol": None,
+        "direction": "LONG",
         "entry_price": 24500.0, "remaining_qty": 100, "price": 24507.0,
         "price_time": (T0 + timedelta(minutes=6)).isoformat(),
         "realized_pnl": 1000.0, "unrealized_pnl": 700.0,

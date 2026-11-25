@@ -665,6 +665,27 @@ class FyersBroker(BaseBroker):
             json=self._order_payload(symbol, side, qty, 3, self._to_tick(stop_price)),
         )
 
+    async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Quote of ``symbol`` from GET {DATA_URL}/quotes: ``lp`` (last traded
+        price), ``bid`` and ``ask``. Fyers has answered 0 or null for option
+        symbols at times, so a value that is not a positive number is None."""
+        session = await self._ensure_session()
+        try:
+            async with session.get(f"{self.DATA_URL}/quotes", params={"symbols": symbol}) as resp:
+                raw = await resp.text()
+        except Exception as exc:
+            print(f"[FYERS] Quote of {symbol} failed: {exc}")
+            return None
+        try:
+            data = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            data = None
+        if not isinstance(data, dict) or data.get("s") != "ok":
+            message = data.get("message") if isinstance(data, dict) else raw[:120]
+            print(f"[FYERS] Quote of {symbol} refused: {message}")
+            return None
+        return parse_quote(data, symbol)
+
     async def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
         data = await self._trading_call("GET", self.ORDER_BOOK_PATH, params={"id": order_id})
         if data.get("s") != "ok":
@@ -720,3 +741,32 @@ class FyersBroker(BaseBroker):
                 "available": next((f.get("equityAmount", 0) for f in funds if f.get("id") == 10), 0),
                 "used": next((f.get("equityAmount", 0) for f in funds if f.get("id") == 11), 0)
             }
+
+
+def _positive(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def parse_quote(data: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
+    """``{"ltp", "bid", "ask"}`` of ``symbol`` in a /quotes reply
+    (``{"s": "ok", "d": [{"n": symbol, "s": "ok", "v": {"lp", "bid", "ask", ...}}]}``),
+    or None when the reply does not hold it."""
+    for item in data.get("d") or []:
+        if not isinstance(item, dict) or item.get("s") != "ok":
+            continue
+        values = item.get("v")
+        if not isinstance(values, dict):
+            continue
+        if (item.get("n") or values.get("symbol")) != symbol:
+            continue
+        quote = {
+            "ltp": _positive(values.get("lp")),
+            "bid": _positive(values.get("bid")),
+            "ask": _positive(values.get("ask")),
+        }
+        return quote if any(v is not None for v in quote.values()) else None
+    return None

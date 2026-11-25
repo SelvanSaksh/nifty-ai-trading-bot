@@ -84,6 +84,14 @@ class Settings(BaseSettings):
     # trades simulate futures in lots of this size. Set it to the current
     # exchange lot. Equities (-EQ) always trade in single shares.
     LOT_SIZE: int = 50
+
+    # ── Index options (Bank Nifty is traded by buying its calls) ─
+    # The signal, stop and targets are Bank Nifty index levels; the trade is
+    # the at-the-money call of the nearest monthly expiry at least this many
+    # IST calendar days away (2: never the contract's last trading day or
+    # the day before). Lot and strikes come from the Fyers symbol master.
+    OPTION_MIN_DAYS_TO_EXPIRY: int = 2
+    FYERS_SYMBOL_MASTER_URL: str = "https://public.fyers.in/sym_details/NSE_FO.csv"
     
     # ── Server ──────────────────────────────────────────────────
     HOST: str = "0.0.0.0"
@@ -136,7 +144,16 @@ def public_config() -> dict:
         "trading_end_time": settings.TRADING_END_TIME,
         "square_off_time": settings.SQUARE_OFF_TIME,
         "lot_size": settings.LOT_SIZE,
+        # Index -> what is bought for it (Bank Nifty: its ATM call).
+        "option_underlyings": _option_underlyings(),
+        "option_min_days_to_expiry": settings.OPTION_MIN_DAYS_TO_EXPIRY,
     }
+
+
+def _option_underlyings() -> dict:
+    from features.option_contracts import OPTION_UNDERLYINGS
+
+    return dict(OPTION_UNDERLYINGS)
 
 
 def ensure_data_dir():
