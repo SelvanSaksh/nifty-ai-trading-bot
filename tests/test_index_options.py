@@ -235,6 +235,9 @@ async def option_bot(db_path, monkeypatch, tmp_path):
 
     monkeypatch.setattr(bot_module, "datetime", Clock)
     monkeypatch.setattr(settings, "PAPER_TRADING", True)
+    # These engine tests size on the worst case at the index stop; the
+    # fixed one-lot paper mode has its own tests below.
+    monkeypatch.setattr(settings, "OPTION_PAPER_ONE_LOT", False)
     monkeypatch.setattr(settings, "CAPITAL", 1_000_000.0)
     monkeypatch.setattr(settings, "RISK_PER_TRADE", 0.01)
     await init_db()
@@ -415,3 +418,55 @@ async def test_the_square_off_sells_the_call_without_an_index_tick(option_bot):
     await option_bot._supervise_trade()
     assert option_bot.active_trade is None
     assert (trade.exit_reason, trade.exit_price) == ("EOD_SQUARE_OFF", 299.5)
+
+
+# ── Paper: always one lot (OPTION_PAPER_ONE_LOT) ─────────────────
+
+def test_one_lot_mode_is_the_default():
+    from config import Settings
+
+    assert Settings.model_fields["OPTION_PAPER_ONE_LOT"].default is True
+
+
+async def test_paper_buys_one_lot_whatever_the_risk_rule_allows(option_bot, monkeypatch):
+    monkeypatch.setattr(settings, "OPTION_PAPER_ONE_LOT", True)
+    monkeypatch.setattr(settings, "CAPITAL", 18_000.0)
+    # 1% of 18,000 is 180; one lot can lose 150 x 30 = 4,500 at the stop.
+    assert await option_bot._enter_trade(signal(), 51012.0) is None
+    trade = option_bot.active_trade
+    assert (trade.option_symbol, trade.quantity, trade.entry_price) == (CALL, 30, 300.5)
+    assert "(1 lot, fixed paper size)" in option_bot.messages[-1]
+
+
+async def test_one_lot_is_refused_only_when_it_costs_more_than_the_capital(option_bot, monkeypatch):
+    monkeypatch.setattr(settings, "OPTION_PAPER_ONE_LOT", True)
+    monkeypatch.setattr(settings, "CAPITAL", 18_000.0)
+    option_bot.broker.quotes[CALL] = {"ltp": 649.0, "bid": 648.5, "ask": 650.0}
+    reason = await option_bot._enter_trade(signal(), 51012.0)
+    assert reason == (
+        "BANKNIFTY 24 Nov 2026 51000 CE (lot 30) at ₹650.00: Position size 0: one lot of 30 "
+        "costs ₹19,500, more than the ₹18,000 position limit"
+    )
+    assert option_bot.active_trade is None
+    # Exactly at the limit (600 x 30 = 18,000) it buys.
+    option_bot.broker.quotes[CALL] = {"ltp": 599.5, "bid": 599.0, "ask": 600.0}
+    assert await option_bot._enter_trade(signal(), 51012.0) is None
+    assert option_bot.active_trade.quantity == 30
+
+
+async def test_one_lot_mode_never_applies_live(option_bot, monkeypatch):
+    monkeypatch.setattr(settings, "OPTION_PAPER_ONE_LOT", True)
+    monkeypatch.setattr(settings, "PAPER_TRADING", False)
+    reason = await option_bot._enter_trade(signal(), 51012.0)
+    assert reason.startswith("Bank Nifty options are paper-traded only")
+    assert option_bot.broker.calls == []
+
+
+async def test_the_loss_limits_still_gate_one_lot_trades(option_bot, monkeypatch):
+    monkeypatch.setattr(settings, "CAPITAL", 18_000.0)
+    rm = option_bot.risk_manager
+    rm.day = "2026-10-26"
+    rm.week = "2026-W44"
+    rm.daily_pnl = -2_100.0  # one losing lot: far past the 450 daily limit
+    ok, reason = await rm.can_trade(datetime(2026, 10, 26, 11, 0))
+    assert not ok and reason == "Daily loss limit hit: ₹-2,100.00 (limit: ₹-450.00)"

@@ -331,6 +331,17 @@ class RiskManager:
             raw_qty = min(raw_qty, int(max_value / premium))
         return size(raw_qty // lot_size * lot_size)
 
+    @staticmethod
+    def one_option_lot(premium: float, lot_size: int, max_value: Optional[float]) -> PositionSize:
+        """Exactly one lot of a bought option (paper mode,
+        OPTION_PAPER_ONE_LOT), whatever RISK_PER_TRADE allows; 0 only when
+        that lot's premium is over ``max_value``. ``allowed_risk`` is what the
+        lot can lose at worst: its whole premium."""
+        lot_size = max(1, int(lot_size))
+        cost = premium * lot_size
+        qty = lot_size if premium > 0 and (max_value is None or cost <= max_value) else 0
+        return PositionSize(qty, lot_size, premium, cost, premium, max_value)
+
     def update_after_trade(self, trade: Trade, now: datetime = None):
         """Update risk counters after trade close (the caller saves).
 

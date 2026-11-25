@@ -21,7 +21,7 @@ services:
       # Trading config
       - BROKER_MODE=${BROKER_MODE:-fyers}
       - PAPER_TRADING=${PAPER_TRADING:-true}
-      - CAPITAL=${CAPITAL:-100000}
+      - CAPITAL=${CAPITAL:-18000}
       - RISK_PER_TRADE=${RISK_PER_TRADE:-0.01}
       - MAX_DAILY_LOSS=${MAX_DAILY_LOSS:-0.025}
       - MAX_WEEKLY_LOSS=${MAX_WEEKLY_LOSS:-0.05}

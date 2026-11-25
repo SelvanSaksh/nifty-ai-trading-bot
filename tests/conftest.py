@@ -4,6 +4,19 @@ from datetime import datetime
 import pytest
 
 
+#: The capital the trade-mechanics tests are written for (₹1,000 risk at
+#: 1%). The shipped default is 18,000 (see test_paper_capital_default);
+#: a test that needs another figure patches settings.CAPITAL itself.
+TEST_CAPITAL = 100_000.0
+
+
+@pytest.fixture(autouse=True)
+def _test_capital(monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "CAPITAL", TEST_CAPITAL)
+
+
 @pytest.fixture(autouse=True)
 def _offline_news(monkeypatch):
     """Keep the suite off the network (RSS is only used for news blackouts)."""

@@ -1294,6 +1294,8 @@ class NiftyBot:
                     return planned
                 contract, premium, sized = planned
                 if sized.qty <= 0:
+                    if self._one_option_lot(paper):
+                        return f"{describe_contract(contract)} at ₹{premium:,.2f}: {sized.why_zero()}"
                     return (
                         f"{describe_contract(contract)} at ₹{premium:,.2f}: {sized.why_zero()} "
                         f"(worst case per unit: the smaller of the premium and the "
@@ -1380,7 +1382,8 @@ class NiftyBot:
             "📊 PAPER OPTION TRADE ENTERED\n"
             f"Bought: {describe_contract(contract)} = {contract.symbol}\n"
             f"Premium: {trade.entry_price} x {trade.quantity} "
-            f"({trade.quantity // contract.lot_size} lot)\n"
+            f"({trade.quantity // contract.lot_size} lot"
+            f"{', fixed paper size' if settings.OPTION_PAPER_ONE_LOT else ''})\n"
             f"{trade.symbol_name} at {trade.underlying_entry_price}: SL {trade.stop_loss} | "
             f"T1 {trade.target_1} | T2 {trade.target_2} | T3 {trade.target_3} (index levels)\n"
             f"Score: {trade.signal_score}/100 | Confidence: {trade.confidence:.0%}"
@@ -1408,11 +1411,19 @@ class NiftyBot:
         premium = await self._option_price(contract.symbol, buying=True, allow_mark=False)
         if premium is None:
             return f"No price for {contract.symbol} ({describe_contract(contract)}): not entered"
-        sized = self.risk_manager.size_option_position(
-            signal, premium, index_price, contract.lot_size,
-            settings.CAPITAL * settings.MAX_POSITION_LEVERAGE,
-        )
+        max_value = settings.CAPITAL * settings.MAX_POSITION_LEVERAGE
+        if self._one_option_lot(paper):
+            sized = self.risk_manager.one_option_lot(premium, contract.lot_size, max_value)
+        else:
+            sized = self.risk_manager.size_option_position(
+                signal, premium, index_price, contract.lot_size, max_value,
+            )
         return contract, premium, sized
+
+    @staticmethod
+    def _one_option_lot(paper: bool) -> bool:
+        """Paper option trades buy a fixed single lot (OPTION_PAPER_ONE_LOT)."""
+        return paper and settings.OPTION_PAPER_ONE_LOT
 
     async def _option_price(
         self, symbol: str, buying: bool, allow_mark: bool = True

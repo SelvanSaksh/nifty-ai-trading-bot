@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     STRUCTURE_START: str = "2026-01-01"
     TRADING_SYMBOL_NAME: str = "Reliance"
     PAPER_TRADING: bool = True
-    CAPITAL: float = 100_000.0
+    CAPITAL: float = 18_000.0
     RISK_PER_TRADE: float = 0.01
     MAX_DAILY_LOSS: float = 0.025
     MAX_WEEKLY_LOSS: float = 0.05
@@ -91,6 +91,12 @@ class Settings(BaseSettings):
     # IST calendar days away (2: never the contract's last trading day or
     # the day before). Lot and strikes come from the Fyers symbol master.
     OPTION_MIN_DAYS_TO_EXPIRY: int = 2
+    # Paper option trades buy exactly 1 lot, ignoring RISK_PER_TRADE (one
+    # lot can lose far more than it allows); refused only when one lot's
+    # premium is over CAPITAL x MAX_POSITION_LEVERAGE. The daily and weekly
+    # loss limits still apply. False: lots sized on the worst case at the
+    # index stop (size_option_position).
+    OPTION_PAPER_ONE_LOT: bool = True
     FYERS_SYMBOL_MASTER_URL: str = "https://public.fyers.in/sym_details/NSE_FO.csv"
     
     # ── Server ──────────────────────────────────────────────────
@@ -147,6 +153,7 @@ def public_config() -> dict:
         # Index -> what is bought for it (Bank Nifty: its ATM call).
         "option_underlyings": _option_underlyings(),
         "option_min_days_to_expiry": settings.OPTION_MIN_DAYS_TO_EXPIRY,
+        "option_paper_one_lot": settings.OPTION_PAPER_ONE_LOT,
     }
 
 
