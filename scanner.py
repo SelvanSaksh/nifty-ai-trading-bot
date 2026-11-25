@@ -9,7 +9,10 @@ its history, the closed candles' indicators (``Analyzer._finalize_candle``),
 belongs to the risk manager, which the bot checks when a trade is due.
 
 Nothing here trades. A symbol is traded only after it is made the active
-symbol, and then only on the bot's own signal.
+symbol, and then only on the bot's own signal. A scan reads history and
+scores it with its own analyzer per symbol; it never reads or changes the
+bot's active symbol, its open trade or its risk counters, so a scan (on the
+15m schedule or asked for from the dashboard) cannot affect trading.
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -42,6 +45,10 @@ CHECK_SECONDS = 15.0
 #: When every symbol failed (broker down, token expired), try again after
 #: this long rather than at once or only at the next bar.
 RETRY_AFTER = timedelta(minutes=2)
+#: Least time between two scans asked for from the dashboard: each scan makes
+#: two history requests per watchlist symbol, on the broker quota the bot's
+#: own orders share.
+MANUAL_COOLDOWN = timedelta(seconds=60)
 
 #: (symbol, timeframe) -> the warm-up history the engine analyzes
 #: (analyzer.WARMUP_DAYS), oldest first.
@@ -92,6 +99,10 @@ class Scanner:
         self.results: List[Dict[str, Any]] = []
         self.scanned_at: Optional[datetime] = None
         self.scanning = False
+        # A scan asked for by request_scan(), run by the run() loop.
+        self._manual_requested = False
+        self._last_manual_at: Optional[datetime] = None
+        self._wake = asyncio.Event()
 
     async def scan_symbol(
         self, symbol: str, name: str, kind: str, now: datetime
@@ -173,21 +184,51 @@ class Scanner:
             self._retry_at = None
         return True
 
+    def request_scan(self, now: Optional[datetime] = None) -> Tuple[str, float]:
+        """Ask the run loop for a scan now, outside the 15m schedule.
+
+        Returns ("queued", 0), ("scanning", 0) when a scan is already running
+        or queued, or ("cooldown", seconds left) within ``MANUAL_COOLDOWN`` of
+        the previous request. The schedule is untouched: the next 15m close
+        is still scanned.
+        """
+        at = now or datetime.utcnow()
+        if self.scanning or self._manual_requested:
+            return "scanning", 0.0
+        if self._last_manual_at is not None:
+            left = (self._last_manual_at + MANUAL_COOLDOWN - at).total_seconds()
+            if left > 0:
+                return "cooldown", left
+        self._last_manual_at = at
+        self._manual_requested = True
+        self._wake.set()
+        return "queued", 0.0
+
     async def run(self):
-        """Scan at every 15m close while the engine runs (cancel to stop)."""
+        """Scan at every 15m close while the engine runs, and when
+        request_scan() asks (cancel to stop)."""
         while True:
             try:
-                await self.scan_if_due()
+                if self._manual_requested:
+                    self._manual_requested = False
+                    await self.scan()
+                else:
+                    await self.scan_if_due()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 print(f"[SCANNER] Scan failed: {exc}")
-            await asyncio.sleep(CHECK_SECONDS)
+            if not self._manual_requested:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), CHECK_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+            self._wake.clear()
 
     def snapshot(self) -> Dict[str, Any]:
         return {
             "scanned_at": self.scanned_at.isoformat() if self.scanned_at else None,
-            "scanning": self.scanning,
+            "scanning": self.scanning or self._manual_requested,
             "timeframe": TIMEFRAME,
             "threshold": self._engine.min_threshold,
             "results": list(self.results),

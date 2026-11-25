@@ -6,8 +6,14 @@ from backtest.data import synthetic
 from backtest.replay import OfflineAnalyzer, minute_ticks
 from decision_engine import DecisionEngine
 from models.candle import Candle
-from scanner import RETRY_AFTER, Scanner, scan_key
+import asyncio
+
+import scanner as scanner_module
+from scanner import MANUAL_COOLDOWN, RETRY_AFTER, Scanner, scan_key
 from utils.live_bars import in_session
+
+#: Scanner.run as written (the conftest swaps it for an idle loop).
+_REAL_RUN = Scanner.run
 
 SYMBOLS = [
     ("NSE:RELIANCE-EQ", "Reliance", "EQUITY"),
@@ -197,3 +203,149 @@ def test_the_bot_scans_its_watchlist_and_the_api_serves_the_ranking(client):
     body = client.get("/api/scanner").json()
     assert body == {"scanned_at": None, "scanning": False, "timeframe": "15m",
                     "threshold": 55, "results": [], "bot_running": bot.is_running}
+
+
+# ── Manual refresh (the dashboard's refresh button) ──────────────
+
+def test_a_refresh_is_queued_once_then_waits_out_the_cooldown():
+    scanner = Scanner(fake_history({}), lambda: [], DecisionEngine(), pace_seconds=0)
+    t = datetime(2026, 11, 2, 5, 0)
+    assert scanner.request_scan(t) == ("queued", 0.0)
+    # Queued, not yet run: shown as scanning, and a second click is refused.
+    assert scanner.snapshot()["scanning"] is True
+    assert scanner.request_scan(t) == ("scanning", 0.0)
+    scanner._manual_requested = False  # as the run loop takes it
+    state, left = scanner.request_scan(t + timedelta(seconds=20))
+    assert state == "cooldown" and left == (MANUAL_COOLDOWN - timedelta(seconds=20)).total_seconds()
+    assert scanner.request_scan(t + MANUAL_COOLDOWN) == ("queued", 0.0)
+
+
+def test_a_refresh_is_refused_while_a_scan_runs():
+    scanner = Scanner(fake_history({}), lambda: [], DecisionEngine(), pace_seconds=0)
+    scanner.scanning = True
+    assert scanner.request_scan() == ("scanning", 0.0)
+
+
+async def test_the_run_loop_scans_at_once_on_a_refresh_and_keeps_the_schedule(monkeypatch):
+    # The conftest idles Scanner.run; this test runs the real loop.
+    monkeypatch.setattr(scanner_module.Scanner, "run", _REAL_RUN)
+    monkeypatch.setattr(scanner_module, "CHECK_SECONDS", 3600.0)
+    calls = []
+
+    async def fetch(symbol, tf):
+        calls.append(tf)
+        return bars(1400) if tf == "15m" else []
+
+    scanner = Scanner(fetch, lambda: SYMBOLS[:1], DecisionEngine(), pace_seconds=0)
+    task = asyncio.create_task(scanner.run())
+    try:
+        # The first pass is the scheduled one (never scanned yet).
+        for _ in range(100):
+            if scanner.scanned_at is not None and not scanner.scanning:
+                break
+            await asyncio.sleep(0.01)
+        first, key = scanner.scanned_at, scanner._last_key
+        assert len(calls) == 2
+        # The loop now sleeps for CHECK_SECONDS (an hour): only the refresh
+        # can wake it.
+        await asyncio.sleep(0.05)
+        assert scanner.request_scan()[0] == "queued"
+        for _ in range(100):
+            if len(calls) == 4 and not scanner.snapshot()["scanning"]:
+                break
+            await asyncio.sleep(0.01)
+        assert len(calls) == 4
+        assert scanner.scanned_at > first
+        # A refresh does not move the schedule: the bar already scanned
+        # stays the last scheduled one.
+        assert scanner._last_key == key
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def test_refresh_needs_a_signed_in_user(db_path):
+    from fastapi.testclient import TestClient
+
+    import main
+
+    with TestClient(main.app) as anonymous:
+        response = anonymous.post("/api/scanner/refresh")
+    assert response.status_code in (401, 403)
+
+
+def test_refresh_queues_a_scan_and_never_touches_the_trade(client, monkeypatch):
+    import main
+    from tests.test_api_symbols import _open_trade
+
+    bot = main.app.state.bot
+    monkeypatch.setattr(bot, "is_running", True)
+    symbol, version = bot.symbol, bot.symbol_version
+    trade = _open_trade(bot.symbol)
+    bot.active_trade = trade
+    before = trade.model_dump()
+    try:
+        response = client.post("/api/scanner/refresh")
+        assert response.status_code == 202
+        body = response.json()
+        assert body["message"] == "Scanning the watchlist" and body["scanning"] is True
+        assert client.get("/api/scanner").json()["scanning"] is True
+
+        again = client.post("/api/scanner/refresh")
+        assert (again.status_code, again.json()["detail"]) == (409, "A scan is already running")
+
+        bot.scanner._manual_requested = False  # as the run loop takes it
+        soon = client.post("/api/scanner/refresh")
+        assert soon.status_code == 429
+        assert soon.json()["detail"].startswith("The watchlist was just rescanned: try again in ")
+        assert int(soon.headers["Retry-After"]) > 0
+
+        # The trade, the active symbol and the gate are as they were.
+        assert bot.active_trade is trade and trade.model_dump() == before
+        assert (bot.symbol, bot.symbol_version) == (symbol, version)
+    finally:
+        bot.active_trade = None
+
+
+def test_refresh_is_refused_while_the_bot_is_stopped(client, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main.app.state.bot, "is_running", False)
+    response = client.post("/api/scanner/refresh")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "The scanner runs while the bot runs: start the bot"
+
+
+async def test_a_scan_with_an_open_trade_changes_nothing_the_bot_trades_on(client):
+    """The scanner only reads history: scoring the traded symbol itself
+    leaves the bot's trade, symbol, buffers and risk counters alone."""
+    import main
+    from tests.test_api_symbols import _open_trade
+
+    bot = main.app.state.bot
+    trade = _open_trade(bot.symbol)
+    bot.active_trade = trade
+    before = (
+        trade.model_dump(), bot.symbol, bot.symbol_version,
+        len(bot.analyzer.candles_15m), len(bot.analyzer.candles_1h),
+        bot.risk_manager.to_state(),
+    )
+    scan = Scanner(
+        fake_history({bot.symbol: bars(1400, step=0.5)}),
+        lambda: [(bot.symbol, bot.symbol_name, "EQUITY")],
+        bot.decision_engine, pace_seconds=0,
+    )
+    try:
+        assert await scan.scan(NOW) is True
+        assert scan.results[0]["error"] is None
+        after = (
+            trade.model_dump(), bot.symbol, bot.symbol_version,
+            len(bot.analyzer.candles_15m), len(bot.analyzer.candles_1h),
+            bot.risk_manager.to_state(),
+        )
+        assert after == before and bot.active_trade is trade
+    finally:
+        bot.active_trade = None

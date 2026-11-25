@@ -1,3 +1,4 @@
+import math
 import sys
 
 # Windows' console defaults to a legacy codepage (cp1252 / "charmap") that
@@ -582,6 +583,29 @@ async def get_scanner():
     engine runs; read-only (nothing is traded from here)."""
     bot: NiftyBot = app.state.bot
     return {**bot.scanner.snapshot(), "bot_running": bot.is_running}
+
+
+@app.post("/api/scanner/refresh", status_code=202, dependencies=[Depends(require_admin)])
+async def refresh_scanner():
+    """Scan the watchlist again now (the dashboard's refresh button). The scan
+    runs in the background; GET /api/scanner shows ``scanning`` until it is
+    done. It only scores: the bot's symbol, open trade and risk limits are
+    untouched. 409 while the engine is stopped or a scan is running, 429
+    within a minute of the previous refresh."""
+    bot: NiftyBot = app.state.bot
+    if not bot.is_running:
+        raise HTTPException(status_code=409, detail="The scanner runs while the bot runs: start the bot")
+    state, wait = bot.scanner.request_scan()
+    if state == "scanning":
+        raise HTTPException(status_code=409, detail="A scan is already running")
+    if state == "cooldown":
+        seconds = max(1, math.ceil(wait))
+        raise HTTPException(
+            status_code=429,
+            detail=f"The watchlist was just rescanned: try again in {seconds}s",
+            headers={"Retry-After": str(seconds)},
+        )
+    return {"message": "Scanning the watchlist", **bot.scanner.snapshot(), "bot_running": True}
 
 
 @app.get("/api/watchlist")
